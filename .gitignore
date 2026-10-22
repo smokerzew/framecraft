@@ -1,0 +1,8 @@
+FrameCraft.xcodeproj/
+build/
+DerivedData/
+*.ipa
+dist/
+Payload/
+.DS_Store
+xcuserdata/

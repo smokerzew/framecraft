@@ -1,0 +1,107 @@
+# Builds and tests FrameCraft on a GitHub-hosted Mac and publishes an UNSIGNED .ipa.
+# The .ipa is signed and installed with Sideloadly using your own Apple ID (see docs/SIDELOADLY_INSTALL.md).
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # publishes the .ipa as a release file (downloadable without signing in)
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select newest Xcode 26
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+
+      - name: Generate the Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+          xcodebuild -list -project FrameCraft.xcodeproj
+
+      - name: Pick an iPhone simulator
+        run: |
+          SIM_ID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          runtimes = sorted((k for k in devices if ".iOS-" in k), reverse=True)
+          print(next(d["udid"] for k in runtimes for d in devices[k] if d["name"].startswith("iPhone")))')
+          echo "SIM_ID=$SIM_ID" >> "$GITHUB_ENV"
+
+      - name: Unit tests (iOS Simulator)
+        run: |
+          set -o pipefail # a failing test fails the job even though output goes through tee
+          xcodebuild test \
+            -project FrameCraft.xcodeproj \
+            -scheme FrameCraft \
+            -destination "id=$SIM_ID" \
+            -resultBundlePath TestResults.xcresult 2>&1 | tee test.log
+
+      - name: Surface test and compile errors as annotations
+        if: failure()
+        run: |
+          # Annotations are readable without signing in, unlike raw logs.
+          for f in test.log build.log; do
+            [ -f "$f" ] || continue
+            grep -E "error:|: failed|XCTAssert|Fatal error|Testing failed" "$f" | sort -u | head -40 | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+          done
+
+      - name: Build unsigned device app (Release)
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -project FrameCraft.xcodeproj \
+            -scheme FrameCraft \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" 2>&1 | tee build.log
+
+      - name: Package and verify the unsigned .ipa
+        run: |
+          APP=build/Build/Products/Release-iphoneos/FrameCraft.app
+          test -d "$APP" || { echo "::error::FrameCraft.app was not built"; exit 1; }
+          test -f "$APP/default.metallib" || { echo "::error::Metal kernels missing from the app"; exit 1; }
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry FrameCraft.ipa Payload
+          unzip -l FrameCraft.ipa | grep -q "Payload/FrameCraft.app/FrameCraft" || { echo "::error::IPA has no app binary"; exit 1; }
+          lipo -info Payload/FrameCraft.app/FrameCraft
+          ls -lh FrameCraft.ipa
+
+      - name: Publish .ipa to the "latest" release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest FrameCraft.ipa --title "Latest build" --notes "Unsigned build of ${GITHUB_SHA::7}" --latest
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: FrameCraft-ipa
+          path: FrameCraft.ipa
+
+      - uses: actions/upload-artifact@v5
+        if: failure()
+        with:
+          name: build-logs
+          path: |
+            test.log
+            build.log

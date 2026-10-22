@@ -1,0 +1,151 @@
+# Builds and tests Camera Glass Pro on a GitHub-hosted Mac and uploads an UNSIGNED .ipa.
+# An unsigned .ipa does not install on its own: sign it with Xcode, or with a tool such as
+# Sideloadly/AltStore using your own Apple ID (see README > "Installing from Windows").
+name: Build IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+# One run per branch at a time: a newer push cancels the older run, so two runs never replace the same
+# release at once (that failed run 77) and "latest" always holds the newest commit's .ipa.
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # lets the job publish the .ipa as a release file (public, no sign-in to download)
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Select newest Xcode 26
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i ios
+
+      - name: Pick an iPhone simulator
+        run: |
+          SIM_ID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          runtimes = sorted((k for k in devices if ".iOS-" in k), reverse=True)
+          print(next(d["udid"] for k in runtimes for d in devices[k] if d["name"].startswith("iPhone")))')
+          echo "SIM_ID=$SIM_ID" >> "$GITHUB_ENV"
+
+      - name: Unit tests (iOS Simulator)
+        run: |
+          set -o pipefail # a failing test must fail the job even though output goes through tee
+          xcodebuild test \
+            -project CameraGlassPro.xcodeproj \
+            -scheme CameraGlassPro \
+            -destination "id=$SIM_ID" \
+            -only-testing:CameraGlassProTests \
+            -resultBundlePath TestResults.xcresult 2>&1 | tee test.log
+
+      # Screenshot tour and tap tests in the running app. They don't block the .ipa: their screenshots are
+      # for review, and their failures show up as annotations.
+      - name: UI tests (screenshot tour, tap tests)
+        if: always()
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project CameraGlassPro.xcodeproj \
+            -scheme CameraGlassPro \
+            -destination "id=$SIM_ID" \
+            -only-testing:CameraGlassProUITests \
+            -resultBundlePath UITestResults.xcresult 2>&1 | tee uitest.log
+
+      - name: Surface UI test failures as annotations
+        if: always()
+        run: |
+          [ -f uitest.log ] || exit 0
+          grep -E "error:|: failed|Testing failed" uitest.log | sort -u | head -30 | while IFS= read -r line; do
+            echo "::warning::UI ${line}"
+          done
+
+      - name: Publish screenshots and look sheets (release "screenshots")
+        if: always() && github.ref == 'refs/heads/main'
+        continue-on-error: true # review material only; never blocks the .ipa
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p shots
+          for bundle in TestResults UITestResults; do
+            [ -d "$bundle.xcresult" ] && xcrun xcresulttool export attachments --path "$bundle.xcresult" --output-path "shots/$bundle" || true
+          done
+          # Name each file after its attachment (manifest.json maps exported files to their names).
+          python3 - <<'PY'
+          import json, os, shutil
+          for bundle in ("TestResults", "UITestResults"):
+              folder = os.path.join("shots", bundle)
+              manifest = os.path.join(folder, "manifest.json")
+              if not os.path.exists(manifest):
+                  continue
+              for test in json.load(open(manifest)):
+                  for item in test.get("attachments", []):
+                      src = os.path.join(folder, item["exportedFileName"])
+                      name = item.get("suggestedHumanReadableName") or item["exportedFileName"]
+                      if os.path.exists(src):
+                          shutil.copy(src, os.path.join("shots", name.replace("/", "-")))
+          PY
+          find shots -maxdepth 1 -type f | sort
+          cd shots && zip -q ../screenshots.zip $(find . -maxdepth 1 -type f \( -name '*.png' -o -name '*.jpeg' -o -name '*.jpg' \)) || true
+          cd ..
+          [ -f screenshots.zip ] || exit 0
+          gh release delete screenshots --yes --cleanup-tag || true
+          gh release create screenshots screenshots.zip --title "Screenshots and look sheets" \
+            --notes "From ${GITHUB_SHA::7}" --prerelease
+
+      - name: Surface test and compile errors as annotations
+        if: failure()
+        run: |
+          # Annotations are readable without signing in, unlike raw logs.
+          [ -f test.log ] || exit 0
+          grep -E "error:|: failed|XCTAssert|Fatal error|Testing failed" test.log | sort -u | head -40 | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
+
+      - name: Build unsigned device app
+        run: |
+          xcodebuild build \
+            -project CameraGlassPro.xcodeproj \
+            -scheme CameraGlassPro \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Package unsigned .ipa
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/CameraGlassPro.app Payload/
+          zip -qry CameraGlassPro-unsigned.ipa Payload
+          ls -lh CameraGlassPro-unsigned.ipa
+
+      - name: Publish .ipa to the "latest" release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest CameraGlassPro-unsigned.ipa             --title "Latest build" --notes "Unsigned build of ${GITHUB_SHA::7}" --latest
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: CameraGlassPro-unsigned-ipa
+          path: CameraGlassPro-unsigned.ipa
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: test-results
+          path: TestResults.xcresult
