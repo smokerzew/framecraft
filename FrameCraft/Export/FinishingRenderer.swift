@@ -103,8 +103,9 @@ struct CaptureMetadata: Equatable, Sendable {
 
     var cameraLine: String {
         let name = [make, model].compactMap { $0 }.filter { !$0.isEmpty }
-        // "Apple iPhone 16 Pro" reads better as "iPhone 16 Pro".
-        if let model, let make, model.lowercased().hasPrefix(make.lowercased()) { return model }
+        // Apple's own model names stand alone ("iPhone 16 Pro", not "Apple iPhone 16 Pro"), as does a model that
+        // already includes the make.
+        if let model, let make, make.lowercased() == "apple" || model.lowercased().contains(make.lowercased()) { return model }
         return name.joined(separator: " ")
     }
 
