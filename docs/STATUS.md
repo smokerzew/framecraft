@@ -9,7 +9,7 @@
 | PHYSICAL CAMERA VERIFIED | Tried with the real camera. |
 | RAW CAPTURE VERIFIED | A RAW or ProRAW photo was taken and edited on a real iPhone. |
 
-**Current state:** source implemented, and the first CI run is in progress. Nothing has been installed or tried on an iPhone yet; the Simulator has no camera.
+**Current state (ad87188):** SOURCE IMPLEMENTED, CI BUILD PASSED (all unit tests pass in the Simulator), IPA PACKAGE VERIFIED. Sideload install, the physical camera and RAW capture are not verified yet; the Simulator has no camera.
 
 ## Known limits (documented, not hidden)
 
