@@ -16,9 +16,14 @@ enum AutoEdit {
         let p05 = percentile(0.05), p95 = percentile(0.95)
         let clipped = Double(luma.filter { $0 >= 0.985 }.count) / Double(luma.count)
 
-        // Exposure toward a mid-tone average, at most a stop, and only when it's clearly off.
-        let ev = log2(0.42 / max(mean, 0.01)) * 0.6
-        if abs(ev) > 0.12 { e.exposure = min(max(ev, -1), 1) }
+        // Exposure only when the average is clearly outside a normal mid-tone range (0.34...0.52), toward the
+        // nearest edge of it, at most a stop. A well exposed photo isn't pushed either way.
+        let normal = 0.34...0.52
+        if !normal.contains(mean) {
+            let goal = mean < normal.lowerBound ? normal.lowerBound : normal.upperBound
+            let ev = log2(goal / max(mean, 0.01)) * 0.6
+            if abs(ev) > 0.1 { e.exposure = min(max(ev, -1), 1) }
+        }
         if clipped > 0.02 { e.highlights = -min(0.6, clipped * 8) }
         if p05 < 0.06 { e.shadows = min(0.4, (0.06 - p05) * 6 + 0.1) }
         if p95 - p05 < 0.55 { e.contrast = min(0.3, (0.55 - (p95 - p05)) * 0.8) }
