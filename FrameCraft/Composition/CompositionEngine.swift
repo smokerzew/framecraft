@@ -78,7 +78,10 @@ enum CompositionEngine {
         let faces = usable.filter { $0.kind == .face }
         if !faces.isEmpty {
             let union = faces.dropFirst().reduce(faces[0].box) { $0.union($1.box) }
-            return SceneSubject(kind: .face, box: union, confidence: faces.map(\.confidence).max() ?? 1)
+            // Keep the direction the faces look (a group facing the same way still needs space in front).
+            let facing = faces.map(\.facing).reduce(0, +) / CGFloat(faces.count)
+            return SceneSubject(kind: .face, box: union, confidence: faces.map(\.confidence).max() ?? 1,
+                                facing: abs(facing) >= 0.5 ? (facing > 0 ? 1 : -1) : 0)
         }
         if let chosen = usable.first(where: { $0.kind == .chosen }) { return chosen }
         if let person = usable.filter({ $0.kind == .person }).max(by: { area($0.box) < area($1.box) }) { return person }
