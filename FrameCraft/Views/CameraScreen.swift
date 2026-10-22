@@ -107,7 +107,7 @@ private struct StatusRow: View {
             .disabled(!app.isAvailable(.flash))
             .opacity(app.isAvailable(.flash) ? 1 : 0.4)
 
-            item("viewfinder", active: app.camera.scan != .idle, label: "Scan composition", value: "") {
+            item("viewfinder", active: app.camera.isCoaching, label: "Auto frame", value: app.camera.isCoaching ? "On" : "Off") {
                 app.perform(.scan)
             }
             .disabled(!app.camera.isRunning)

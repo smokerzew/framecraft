@@ -8,6 +8,8 @@ struct SceneSubject: Equatable, Sendable {
     var kind: Kind
     var box: CGRect
     var confidence: Double
+    /// Which way a face looks in the picture: -1 left, +1 right, 0 toward the camera or unknown.
+    var facing: CGFloat = 0
 }
 
 /// What the analyzer measured in one frame. Nothing here is a judgment, only measurements.
@@ -21,6 +23,10 @@ struct SceneFeatures: Equatable, Sendable {
     var shadowClipping: Double = 0
     /// Width / height of the frame.
     var imageAspect: CGFloat = 3.0 / 4.0
+    /// Body joints of the people found (for framing that never cuts at a joint).
+    var poses: [PersonPose] = []
+    /// Where the horizon crosses the middle of the frame, when one was found.
+    var horizon: HorizonLine?
 }
 
 struct CompositionGuidance: Equatable, Identifiable, Sendable {

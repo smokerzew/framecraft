@@ -61,6 +61,18 @@ final class LiveCameraModel {
     private(set) var imageAspect: CGFloat = 3.0 / 4.0
     private var pendingSubjectTap: CGPoint?
 
+    // Live framing coach (AUTO FRAME)
+    private(set) var isCoaching = false
+    private(set) var coachPlan: FramingPlan?
+    private(set) var coachAdvice: CoachAdvice?
+    private(set) var coachAlternative: FramingPlan?
+    private(set) var coachNotes: [CompositionGuidance] = []
+    @ObservationIgnored private var coachLostSince: Date?
+    @ObservationIgnored private var coachMargin = 0.08
+    /// Current zoom (Camera-app units) and the capture frame's width / height, for the coach's measurements.
+    private(set) var zoom: CGFloat = 1
+    var captureAspect: CGFloat = 0.75
+
     let service = CameraService()
     let frames = FrameRouter()
     let look = LiveLookRenderer()
@@ -77,6 +89,7 @@ final class LiveCameraModel {
         }
         frames.onScan = { [weak self] features in self?.finishScan(features) }
         frames.onTrack = { [weak self] box in self?.updateTracking(box) }
+        frames.onLive = { [weak self] features in self?.updateCoach(features) }
     }
 
     var isRunning: Bool { status == .running }
@@ -102,6 +115,7 @@ final class LiveCameraModel {
         do {
             capabilities = try await service.start(position: position)
             status = .running
+            if isCoaching { frames.setLive(interval: 0.2) }
             if !supportsAnyRAW { setRaw(.off) } else if rawMode == .proRAW, !capabilities.supportsProRAW { setRaw(.raw) }
             reapplyManual()
         } catch {
@@ -111,6 +125,7 @@ final class LiveCameraModel {
     }
 
     func stop() {
+        frames.setLive(interval: nil)
         frames.stopTracking()
         readingsTask?.cancel()
         if torch { setTorch(false) }
@@ -134,6 +149,7 @@ final class LiveCameraModel {
     func setZoom(_ zoom: CGFloat, animated: Bool = false) -> CGFloat {
         let value = min(max(zoom, capabilities.minZoom), max(capabilities.minZoom, capabilities.maxZoom))
         service.setZoom(value, animated: animated)
+        self.zoom = value
         return value
     }
 
@@ -182,6 +198,79 @@ final class LiveCameraModel {
         let options: [RawCaptureMode] = [.off] + (capabilities.supportsRAW ? [.raw] : []) + (capabilities.supportsProRAW ? [.proRAW] : [])
         let index = options.firstIndex(of: rawMode) ?? 0
         setRaw(options[(index + 1) % options.count])
+    }
+
+    // MARK: Live framing coach
+
+    /// Re-analyzes the scene about five times a second and keeps a steady framing target with live advice.
+    func startCoaching() {
+        isCoaching = true
+        coachMargin = 0.08
+        if isRunning { frames.setLive(interval: 0.2) }
+    }
+
+    func stopCoaching() {
+        isCoaching = false
+        frames.setLive(interval: nil)
+        coachPlan = nil
+        coachAdvice = nil
+        coachAlternative = nil
+        coachNotes = []
+    }
+
+    /// Switches to the other framing idea and holds it more firmly (it was chosen on purpose).
+    func useAlternative() {
+        guard let alternative = coachAlternative else { return }
+        coachAlternative = coachPlan
+        coachPlan = alternative
+        coachMargin = 0.2
+        if let features = lastFeatures { updateCoach(features) }
+    }
+
+    var viewContext: ViewContext {
+        ViewContext(visible: AspectFillMapping.visibleRect(imageAspect: imageAspect, viewSize: CGSize(width: captureAspect, height: 1)),
+                    zoom: zoom, minZoom: capabilities.minZoom, maxZoom: max(capabilities.minZoom, capabilities.maxZoom),
+                    isFront: position == .front)
+    }
+
+    private func updateCoach(_ features: SceneFeatures) {
+        guard isCoaching else { return }
+        lastFeatures = features
+        imageAspect = features.imageAspect
+        coachNotes = CompositionEngine.exposureAndLevelGuidance(features, isFrontCamera: position == .front)
+        let view = viewContext
+        let candidates = FramingCoach.plans(features, view: view, aspect: captureAspect)
+        guard !candidates.isEmpty else {
+            // A missed detection or two shouldn't wipe the target; after a second with nothing, say so.
+            let since = coachLostSince ?? Date()
+            coachLostSince = since
+            if Date().timeIntervalSince(since) > 1 {
+                coachPlan = nil
+                coachAdvice = nil
+                coachAlternative = nil
+            }
+            return
+        }
+        coachLostSince = nil
+        guard let plan = FramingCoach.stabilized(previous: coachPlan, candidates: candidates, margin: coachMargin) else { return }
+        coachPlan = plan
+        coachAlternative = candidates.first { !$0.sameIdea(as: plan) }
+        let horizonNow = features.horizon.map { ($0.y - view.visible.minY) / view.visible.height }
+        let advice = FramingCoach.advice(for: plan, view: view, horizonNow: horizonNow)
+        if advice.isAligned, coachAdvice?.isAligned != true { alignedPulse += 1 }
+        coachAdvice = advice
+    }
+
+    /// Fallback: crop the next photo to the best framing inside what the camera sees (no moving needed).
+    func cropInstead() {
+        guard let features = lastFeatures,
+              let best = CompositionEngine.analyze(features, aspect: captureAspect, isFrontCamera: position == .front).primary else { return }
+        frame = best.rect
+        frameIsCustom = false
+        frames.startTracking(best.subject.box)
+        trackedBox = best.subject.box
+        subjectLost = false
+        updateAlignment()
     }
 
     // MARK: Composition scan

@@ -9,7 +9,9 @@ struct LiveCompositionArea: View {
 
     var body: some View {
         Group {
-            if camera.scan == .scanning {
+            if camera.isCoaching {
+                CoachCard(app: app)
+            } else if camera.scan == .scanning {
                 CameraTag(text: "ANALYZING SCENE…", isOff: true)
             } else if let result = camera.scanResult {
                 CompositionCard(app: app, result: result)
@@ -44,6 +46,85 @@ struct LiveCompositionArea: View {
             }
             .accessibilityLabel("Remove frame")
         }
+    }
+}
+
+/// AUTO FRAME's live card: the shot it's aiming for, what to do (move, tilt, zoom), one measured note,
+/// and SET ZOOM / ALTERNATIVE / CROP INSTEAD.
+private struct CoachCard: View {
+    @Bindable var app: AppModel
+
+    private var camera: LiveCameraModel { app.camera }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                if let plan = camera.coachPlan, let advice = camera.coachAdvice {
+                    Text(advice.isAligned ? "FRAMED · HOLD STILL" : plan.kind.title)
+                        .font(.caption.weight(.semibold))
+                        .tracking(1.1)
+                        .foregroundStyle(advice.isAligned ? Color.yellow : .white)
+                } else {
+                    Text("LOOKING FOR A SUBJECT OR HORIZON…")
+                        .font(.caption.weight(.semibold))
+                        .tracking(1.1)
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+                Spacer()
+                Button {
+                    app.mode = .photo
+                    app.modeChanged()
+                } label: {
+                    Image(systemName: "xmark").font(.system(size: 12, weight: .bold)).foregroundStyle(.white)
+                        .frame(width: 28, height: 28)
+                }
+                .accessibilityLabel("Turn off auto frame")
+            }
+            if let advice = camera.coachAdvice, !advice.isAligned, !advice.hints.isEmpty {
+                Text(advice.hints.joined(separator: " · "))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+            }
+            if let note = camera.coachNotes.first {
+                Label(note.text, systemImage: "ruler")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.8))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 8) {
+                if let zoom = camera.coachAdvice?.zoomTo {
+                    pill("ZOOM " + ZoomLimits.label(for: zoom) + "×", highlighted: true) { app.applyCoachZoom() }
+                }
+                if camera.coachAlternative != nil {
+                    pill("ALTERNATIVE") { camera.useAlternative() }
+                }
+                if camera.coachPlan != nil {
+                    pill("CROP INSTEAD") {
+                        camera.cropInstead()
+                        app.mode = .photo
+                        app.modeChanged()
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: 380, alignment: .leading)
+        .cameraGlass(.regular, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Auto frame")
+    }
+
+    private func pill(_ title: String, highlighted: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.caption2.weight(.semibold))
+                .tracking(0.8)
+                .foregroundStyle(highlighted ? Color.yellow : .white)
+                .padding(.horizontal, 12)
+                .frame(minHeight: 30)
+                .cameraGlass(highlighted ? .selected : .interactive, in: Capsule())
+        }
+        .buttonStyle(PressableButtonStyle())
     }
 }
 

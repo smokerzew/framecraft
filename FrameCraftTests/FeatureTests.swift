@@ -448,3 +448,107 @@ final class EditSessionTests: XCTestCase {
         XCTAssertEqual(reset.look, .silverTone)
     }
 }
+
+final class FramingCoachTests: XCTestCase {
+    private let view = ViewContext(visible: CGRect(x: 0, y: 0, width: 1, height: 1), zoom: 1, minZoom: 0.5, maxZoom: 15)
+
+    func testFaceDirectionFromLandmarks() {
+        XCTAssertEqual(SceneAnalyzer.facing(nose: CGPoint(x: 0.62, y: 0.5), leftEye: CGPoint(x: 0.35, y: 0.6), rightEye: CGPoint(x: 0.65, y: 0.6)), 1)
+        XCTAssertEqual(SceneAnalyzer.facing(nose: CGPoint(x: 0.38, y: 0.5), leftEye: CGPoint(x: 0.35, y: 0.6), rightEye: CGPoint(x: 0.65, y: 0.6)), -1)
+        XCTAssertEqual(SceneAnalyzer.facing(nose: CGPoint(x: 0.51, y: 0.5), leftEye: CGPoint(x: 0.35, y: 0.6), rightEye: CGPoint(x: 0.65, y: 0.6)), 0)
+    }
+
+    func testLeadSpaceGoesInFrontOfTheFace() throws {
+        var f = SceneFeatures()
+        f.subjects = [SceneSubject(kind: .face, box: CGRect(x: 0.45, y: 0.3, width: 0.1, height: 0.08), confidence: 0.9, facing: 1)]
+        let best = try XCTUnwrap(FramingCoach.plans(f, view: view, aspect: 0.75).first)
+        XCTAssertLessThan(best.anchor.x, 0.45, "looking right, so the face goes left with space to the right")
+        f.subjects[0].facing = -1
+        let other = try XCTUnwrap(FramingCoach.plans(f, view: view, aspect: 0.75).first)
+        XCTAssertGreaterThan(other.anchor.x, 0.55)
+    }
+
+    func testPersonFramesNeverCutAtAJoint() throws {
+        var f = SceneFeatures()
+        f.subjects = [SceneSubject(kind: .face, box: CGRect(x: 0.46, y: 0.12, width: 0.08, height: 0.07), confidence: 0.9),
+                      SceneSubject(kind: .person, box: CGRect(x: 0.38, y: 0.1, width: 0.24, height: 0.85), confidence: 0.9)]
+        f.poses = [PersonPose(joints: [
+            .nose: CGPoint(x: 0.5, y: 0.16), .neck: CGPoint(x: 0.5, y: 0.22),
+            .leftShoulder: CGPoint(x: 0.44, y: 0.23), .rightShoulder: CGPoint(x: 0.56, y: 0.23),
+            .leftElbow: CGPoint(x: 0.42, y: 0.36), .rightElbow: CGPoint(x: 0.58, y: 0.36),
+            .leftWrist: CGPoint(x: 0.41, y: 0.47), .rightWrist: CGPoint(x: 0.59, y: 0.47),
+            .leftHip: CGPoint(x: 0.46, y: 0.5), .rightHip: CGPoint(x: 0.54, y: 0.5),
+            .leftKnee: CGPoint(x: 0.46, y: 0.7), .rightKnee: CGPoint(x: 0.54, y: 0.7),
+            .leftAnkle: CGPoint(x: 0.46, y: 0.9), .rightAnkle: CGPoint(x: 0.54, y: 0.9),
+        ])]
+        let plans = FramingCoach.plans(f, view: view, aspect: 0.75)
+        let best = try XCTUnwrap(plans.first)
+        XCTAssertNotEqual(best.kind, .subject, "a person with a pose gets a person framing")
+        XCTAssertEqual(best.breakdown["joints"] ?? 0, 1, accuracy: 0.0001, "the best frame cuts no joint")
+        for joint in [0.36, 0.47, 0.5, 0.7, 0.9] as [CGFloat] {
+            XCTAssertGreaterThan(abs(best.rect.maxY - joint), 0.01, "bottom edge isn't on a joint at \(joint)")
+        }
+        XCTAssertEqual(Set(plans.map(\.kind)), [.headAndShoulders, .waistUp, .kneesUp, .fullBody])
+    }
+
+    func testHorizonIsFoundFromTheBrightnessStep() throws {
+        let rows = (0..<48).map { $0 < 19 ? 0.8 : 0.3 }
+        let texture = (0..<48).map { $0 < 19 ? 0.01 : 0.08 }
+        let horizon = try XCTUnwrap(SceneAnalyzer.horizon(rows: rows, texture: texture, visionFound: false))
+        XCTAssertEqual(horizon.y, 19.0 / 48, accuracy: 0.03)
+        XCTAssertTrue(horizon.skyIsPlain)
+        XCTAssertNil(SceneAnalyzer.horizon(rows: Array(repeating: 0.5, count: 48), texture: Array(repeating: 0.02, count: 48), visionFound: true))
+    }
+
+    func testLandscapePutsTheHorizonOnAThird() throws {
+        var f = SceneFeatures()
+        f.horizon = HorizonLine(y: 0.5, skyIsPlain: true)
+        let best = try XCTUnwrap(FramingCoach.plans(f, view: view, aspect: 0.75).first)
+        XCTAssertEqual(best.kind, .landscape)
+        XCTAssertEqual(try XCTUnwrap(best.horizonTarget), 1.0 / 3, accuracy: 0.001, "plain sky: horizon high, more foreground")
+        let advice = FramingCoach.advice(for: best, view: view, horizonNow: 0.5)
+        XCTAssertTrue(advice.hints.contains("Tilt down"), "the horizon has to move up in the picture: \(advice.hints)")
+        XCTAssertFalse(advice.isAligned)
+    }
+
+    func testAdviceDirectionsZoomAndStepBack() {
+        // Subject at the far left, plan wants it on the left third at the same size.
+        var plan = FramingPlan(kind: .subject, rect: CGRect(x: 0, y: 0, width: 1, height: 1), anchor: CGPoint(x: 1.0 / 3, y: 1.0 / 3),
+                               anchorNow: CGPoint(x: 0.1, y: 1.0 / 3), horizonTarget: nil, score: 1, breakdown: [:])
+        var advice = FramingCoach.advice(for: plan, view: view, horizonNow: nil)
+        XCTAssertEqual(advice.hints, ["Pan left"], "the subject must move right in the picture")
+        plan.anchorNow = CGPoint(x: 1.0 / 3, y: 1.0 / 3)
+        XCTAssertTrue(FramingCoach.advice(for: plan, view: view, horizonNow: nil).isAligned)
+
+        plan.rect = CGRect(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
+        plan.anchorNow = CGPoint(x: 0.25 + 0.5 / 3, y: 0.25 + 0.5 / 3)
+        advice = FramingCoach.advice(for: plan, view: view, horizonNow: nil)
+        XCTAssertEqual(advice.zoomTo ?? 0, 2, accuracy: 0.001)
+        XCTAssertEqual(advice.hints, ["Zoom to 2×"], "already in the right spot for the zoomed frame")
+
+        plan.rect = CGRect(x: -0.5, y: -0.5, width: 2, height: 2)
+        let wide = FramingCoach.advice(for: plan, view: ViewContext(visible: view.visible, zoom: 0.5, minZoom: 0.5, maxZoom: 15), horizonNow: nil)
+        XCTAssertTrue(wide.stepBack, "can't zoom out past the widest lens")
+        XCTAssertNil(wide.zoomTo)
+    }
+
+    func testFrontCameraGetsRingInstructions() {
+        let plan = FramingPlan(kind: .subject, rect: CGRect(x: 0, y: 0, width: 1, height: 1), anchor: CGPoint(x: 1.0 / 3, y: 1.0 / 3),
+                               anchorNow: CGPoint(x: 0.8, y: 0.8), horizonTarget: nil, score: 1, breakdown: [:])
+        var front = view
+        front.isFront = true
+        XCTAssertEqual(FramingCoach.advice(for: plan, view: front, horizonNow: nil).hints, ["Line up with the ring"])
+    }
+
+    func testTargetHoldsSteadyUntilSomethingIsClearlyBetter() {
+        func plan(_ x: CGFloat, _ score: Double) -> FramingPlan {
+            FramingPlan(kind: .subject, rect: CGRect(x: 0, y: 0, width: 1, height: 1), anchor: CGPoint(x: x, y: 1.0 / 3),
+                        anchorNow: .zero, horizonTarget: nil, score: score, breakdown: [:])
+        }
+        let previous = plan(1.0 / 3, 0.8)
+        let held = FramingCoach.stabilized(previous: previous, candidates: [plan(2.0 / 3, 0.85), plan(0.34, 0.8)])
+        XCTAssertLessThan(held?.anchor.x ?? 1, 0.5, "a slightly better other third doesn't steal the target")
+        let switched = FramingCoach.stabilized(previous: previous, candidates: [plan(2.0 / 3, 0.95), plan(0.34, 0.8)])
+        XCTAssertGreaterThan(switched?.anchor.x ?? 0, 0.5, "a clearly better one does")
+    }
+}

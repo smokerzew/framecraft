@@ -2,15 +2,16 @@ import CoreImage
 import CoreVideo
 import Vision
 
-/// Measures one camera frame with Vision (faces, people, salient objects, horizon) plus a luminance sample.
-/// Frames arrive already upright (portrait) and mirrored like the preview, so results map straight onto it.
+/// Measures one camera frame with Vision (faces with their direction, people with their body joints, salient
+/// objects, horizon) plus a luminance profile. Frames arrive upright (portrait) and mirrored like the preview,
+/// so every result maps straight onto what's on screen.
 enum SceneAnalyzer {
     static func analyze(_ buffer: CVPixelBuffer) -> SceneFeatures {
         var features = SceneFeatures()
         let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
         features.imageAspect = height > 0 ? CGFloat(width) / CGFloat(height) : 0.75
 
-        let faces = VNDetectFaceRectanglesRequest()
+        let faces = VNDetectFaceLandmarksRequest()
         let people = VNDetectHumanRectanglesRequest()
         people.upperBodyOnly = false
         let saliency = VNGenerateObjectnessBasedSaliencyImageRequest()
@@ -18,41 +19,106 @@ enum SceneAnalyzer {
         let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: .up)
         try? handler.perform([faces, people, saliency, horizon])
 
-        // Vision boxes are bottom-left origin; flip to top-left.
+        // Vision boxes and points are bottom-left origin; flip to top-left.
         func flip(_ r: CGRect) -> CGRect { CGRect(x: r.minX, y: 1 - r.maxY, width: r.width, height: r.height) }
         for face in faces.results ?? [] {
-            features.subjects.append(SceneSubject(kind: .face, box: flip(face.boundingBox), confidence: Double(face.confidence)))
+            features.subjects.append(SceneSubject(kind: .face, box: flip(face.boundingBox), confidence: Double(face.confidence),
+                                                  facing: facing(of: face)))
         }
-        for person in people.results ?? [] {
+        let persons = people.results ?? []
+        for person in persons {
             features.subjects.append(SceneSubject(kind: .person, box: flip(person.boundingBox), confidence: Double(person.confidence)))
         }
         for object in (saliency.results?.first?.salientObjects ?? []) {
             features.subjects.append(SceneSubject(kind: .salient, box: flip(object.boundingBox), confidence: Double(object.confidence)))
+        }
+        if !persons.isEmpty {
+            // Body pose only when there's someone to frame (it's the slowest request).
+            let pose = VNDetectHumanBodyPoseRequest()
+            try? handler.perform([pose])
+            features.poses = (pose.results ?? []).compactMap(Self.pose)
         }
         if let line = horizon.results?.first {
             // The horizon's own angle (counterclockwise positive). shortcut: sign only reasoned from the docs,
             // not yet checked on a device; if the level hint points the wrong way, negate this.
             features.horizonDegrees = Double(line.angle) * 180 / .pi
         }
-        let luma = sampleLuminance(buffer)
-        features.meanLuminance = luma.mean
-        features.highlightClipping = luma.high
-        features.shadowClipping = luma.low
+        let sample = sampleLuminance(buffer)
+        features.meanLuminance = sample.mean
+        features.highlightClipping = sample.high
+        features.shadowClipping = sample.low
+        features.horizon = Self.horizon(rows: sample.rows, texture: sample.texture, visionFound: features.horizonDegrees != nil)
         return features
     }
 
-    /// Mean luminance and clipped fractions from a coarse grid of BGRA pixels.
-    static func sampleLuminance(_ buffer: CVPixelBuffer) -> (mean: Double, high: Double, low: Double) {
-        guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA else { return (0.5, 0, 0) }
+    /// -1 looking left, +1 looking right (as seen in the picture), 0 toward the camera: the nose sits off-center
+    /// from the eyes toward the side the face is turned.
+    static func facing(of face: VNFaceObservation) -> CGFloat {
+        guard let landmarks = face.landmarks, let nose = landmarks.nose?.normalizedPoints, !nose.isEmpty,
+              let left = landmarks.leftEye?.normalizedPoints, let right = landmarks.rightEye?.normalizedPoints,
+              !left.isEmpty, !right.isEmpty else { return 0 }
+        func mean(_ ps: [CGPoint]) -> CGPoint {
+            CGPoint(x: ps.map(\.x).reduce(0, +) / CGFloat(ps.count), y: ps.map(\.y).reduce(0, +) / CGFloat(ps.count))
+        }
+        return facing(nose: mean(nose), leftEye: mean(left), rightEye: mean(right))
+    }
+
+    /// Pure part of `facing(of:)`, for tests. Points share one coordinate space; x grows to the right.
+    static func facing(nose: CGPoint, leftEye: CGPoint, rightEye: CGPoint) -> CGFloat {
+        let mid = (leftEye.x + rightEye.x) / 2
+        let span = abs(rightEye.x - leftEye.x)
+        guard span > 0.0001 else { return 0 }
+        let offset = (nose.x - mid) / span
+        return offset > 0.12 ? 1 : offset < -0.12 ? -1 : 0
+    }
+
+    private static func pose(_ observation: VNHumanBodyPoseObservation) -> PersonPose? {
+        guard let points = try? observation.recognizedPoints(.all) else { return nil }
+        let names: [(VNHumanBodyPoseObservation.JointName, BodyJoint)] = [
+            (.nose, .nose), (.neck, .neck), (.leftShoulder, .leftShoulder), (.rightShoulder, .rightShoulder),
+            (.leftElbow, .leftElbow), (.rightElbow, .rightElbow), (.leftWrist, .leftWrist), (.rightWrist, .rightWrist),
+            (.leftHip, .leftHip), (.rightHip, .rightHip), (.leftKnee, .leftKnee), (.rightKnee, .rightKnee),
+            (.leftAnkle, .leftAnkle), (.rightAnkle, .rightAnkle),
+        ]
+        var joints: [BodyJoint: CGPoint] = [:]
+        for (vision, mine) in names {
+            if let p = points[vision], p.confidence >= 0.3 { joints[mine] = CGPoint(x: p.location.x, y: 1 - p.location.y) }
+        }
+        return joints.count >= 4 ? PersonPose(joints: joints) : nil
+    }
+
+    /// The horizon's height from the row profile: the split with the biggest brightness step between above and
+    /// below, accepted when the step is clear (or Vision also found a horizon). The sky counts as plain when
+    /// the rows above it have little texture.
+    static func horizon(rows: [Double], texture: [Double], visionFound: Bool) -> HorizonLine? {
+        let n = rows.count
+        guard n >= 12, texture.count == n else { return nil }
+        var best = (index: 0, step: 0.0)
+        for i in Int(Double(n) * 0.15)..<Int(Double(n) * 0.85) {
+            let above = rows[max(0, i - 6)..<i], below = rows[i..<min(n, i + 6)]
+            let step = above.reduce(0, +) / Double(above.count) - below.reduce(0, +) / Double(below.count)
+            if abs(step) > abs(best.step) { best = (i, step) }
+        }
+        // Sky is usually the brighter part; a clear step, or a weaker one that Vision confirms.
+        guard best.step > 0.18 || (visionFound && best.step > 0.08) else { return nil }
+        let skyTexture = texture[0..<best.index].reduce(0, +) / Double(max(best.index, 1))
+        return HorizonLine(y: CGFloat(best.index) / CGFloat(n), skyIsPlain: skyTexture < 0.035)
+    }
+
+    /// Mean luminance, clipped fractions, and per-row brightness and texture from a coarse grid of BGRA pixels.
+    static func sampleLuminance(_ buffer: CVPixelBuffer) -> (mean: Double, high: Double, low: Double, rows: [Double], texture: [Double]) {
+        guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA else { return (0.5, 0, 0, [], []) }
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return (0.5, 0, 0) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { return (0.5, 0, 0, [], []) }
         let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
         let row = CVPixelBufferGetBytesPerRow(buffer)
         let pixels = base.assumingMemoryBound(to: UInt8.self)
         let step = max(1, min(width, height) / 64)
         var sum = 0.0, high = 0, low = 0, count = 0
+        var rows: [Double] = [], texture: [Double] = []
         for y in stride(from: 0, to: height, by: step) {
+            var rowSum = 0.0, rowCount = 0.0, change = 0.0, last: Double?
             for x in stride(from: 0, to: width, by: step) {
                 let p = pixels + y * row + x * 4
                 let l = (0.0722 * Double(p[0]) + 0.7152 * Double(p[1]) + 0.2126 * Double(p[2])) / 255
@@ -60,10 +126,16 @@ enum SceneAnalyzer {
                 if l >= 0.98 { high += 1 }
                 if l <= 0.02 { low += 1 }
                 count += 1
+                rowSum += l
+                rowCount += 1
+                if let last { change += abs(l - last) }
+                last = l
             }
+            rows.append(rowSum / max(rowCount, 1))
+            texture.append(change / max(rowCount - 1, 1))
         }
-        guard count > 0 else { return (0.5, 0, 0) }
-        return (sum / Double(count), Double(high) / Double(count), Double(low) / Double(count))
+        guard count > 0 else { return (0.5, 0, 0, [], []) }
+        return (sum / Double(count), Double(high) / Double(count), Double(low) / Double(count), rows, texture)
     }
 }
 
@@ -116,9 +188,13 @@ final class FrameRouter: @unchecked Sendable {
     private var tracker: SubjectTracker?
     private var latest: CVPixelBuffer?
     private var lastTrack = Date.distantPast
+    private var liveInterval: TimeInterval?
+    private var lastLive = Date.distantPast
 
     var look: LiveLookRenderer?
     var onScan: (@MainActor (SceneFeatures) -> Void)?
+    /// Continuous analysis for the live framing coach (a few times a second while it's on).
+    var onLive: (@MainActor (SceneFeatures) -> Void)?
     var onTrack: (@MainActor (CGRect?) -> Void)?
 
     func handle(_ buffer: CVPixelBuffer) {
@@ -126,10 +202,12 @@ final class FrameRouter: @unchecked Sendable {
         lock.lock()
         latest = buffer
         let wantsScan = scanRequests > 0
-        let wantsTrack = tracker != nil && Date().timeIntervalSince(lastTrack) >= 1.0 / 15
-        guard !busy, wantsScan || wantsTrack else { lock.unlock(); return }
+        let wantsLive = !wantsScan && liveInterval.map { Date().timeIntervalSince(lastLive) >= $0 } == true
+        let wantsTrack = !wantsLive && tracker != nil && Date().timeIntervalSince(lastTrack) >= 1.0 / 15
+        guard !busy, wantsScan || wantsLive || wantsTrack else { lock.unlock(); return }
         busy = true
         if wantsTrack { lastTrack = Date() }
+        if wantsLive { lastLive = Date() }
         let tracker = self.tracker
         lock.unlock()
 
@@ -147,6 +225,10 @@ final class FrameRouter: @unchecked Sendable {
                     let callback = onScan
                     DispatchQueue.main.async { MainActor.assumeIsolated { callback?(merged) } }
                 }
+            } else if wantsLive {
+                let features = SceneAnalyzer.analyze(buffer)
+                let callback = onLive
+                DispatchQueue.main.async { MainActor.assumeIsolated { callback?(features) } }
             } else if let tracker {
                 let box = tracker.update(buffer)
                 let callback = onTrack
@@ -163,6 +245,14 @@ final class FrameRouter: @unchecked Sendable {
         lock.lock()
         scanRequests = frames
         scanFrames = []
+        lock.unlock()
+    }
+
+    /// Starts (or stops, with nil) continuous analysis at most once per `interval`; it waits while Vision is busy,
+    /// so slower phones simply analyze less often.
+    func setLive(interval: TimeInterval?) {
+        lock.lock()
+        liveInterval = interval
         lock.unlock()
     }
 

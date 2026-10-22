@@ -93,6 +93,12 @@ struct LiveViewfinderView: View {
                                 isAlternative: camera.showsAlternative)
                     .transition(.opacity)
             }
+            if camera.isCoaching, let advice = camera.coachAdvice {
+                CoachGuide(advice: advice,
+                           idealFrame: camera.coachPlan.map { AspectFillMapping.toView($0.rect, imageAspect: aspect, viewSize: frame) },
+                           size: frame)
+                    .transition(.opacity)
+            }
             if let chosen = camera.frame {
                 FrameGuide(rect: AspectFillMapping.toView(chosen, imageAspect: aspect, viewSize: frame),
                            viewSize: frame,
@@ -253,6 +259,59 @@ private struct SuggestionGuide: View {
                 .frame(width: 8, height: 8)
                 .position(x: rect.minX + target.x * rect.width, y: rect.minY + target.y * rect.height)
         }
+    }
+}
+
+/// Live coach: the ideal frame's outline, a ring where the subject (or a line where the horizon) should go,
+/// and where it is now. The ring fills yellow once the shot is framed.
+private struct CoachGuide: View {
+    let advice: CoachAdvice
+    let idealFrame: CGRect?
+    let size: CGSize
+
+    var body: some View {
+        let target = CGPoint(x: advice.target.x * size.width, y: advice.target.y * size.height)
+        ZStack {
+            if let idealFrame, !advice.isAligned {
+                RoundedRectangle(cornerRadius: 4)
+                    .stroke(.white.opacity(0.55), style: StrokeStyle(lineWidth: 1.2, dash: [6, 5]))
+                    .frame(width: idealFrame.width, height: idealFrame.height)
+                    .position(x: idealFrame.midX, y: idealFrame.midY)
+            }
+            if let horizon = advice.horizonTarget {
+                line(at: horizon * size.height, color: .yellow, dashed: true)
+            }
+            if let now = advice.horizonNow, advice.horizonTarget != nil, !advice.isAligned {
+                line(at: now * size.height, color: .white.opacity(0.8), dashed: false)
+            }
+            if let current = advice.current {
+                let here = CGPoint(x: current.x * size.width, y: current.y * size.height)
+                if !advice.isAligned {
+                    Path { p in
+                        p.move(to: here)
+                        p.addLine(to: target)
+                    }
+                    .stroke(.white.opacity(0.7), style: StrokeStyle(lineWidth: 1.5, dash: [4, 4]))
+                    Circle().fill(.white).frame(width: 10, height: 10).position(here).shadow(radius: 1)
+                }
+                Circle()
+                    .strokeBorder(Color.yellow, lineWidth: advice.isAligned ? 3 : 2)
+                    .background(Circle().fill(Color.yellow.opacity(advice.isAligned ? 0.35 : 0)))
+                    .frame(width: advice.isAligned ? 52 : 44, height: advice.isAligned ? 52 : 44)
+                    .position(target)
+                    .shadow(color: .black.opacity(0.4), radius: 1)
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: advice)
+    }
+
+    private func line(at y: CGFloat, color: Color, dashed: Bool) -> some View {
+        Path { p in
+            p.move(to: CGPoint(x: 0, y: y))
+            p.addLine(to: CGPoint(x: size.width, y: y))
+        }
+        .stroke(color, style: StrokeStyle(lineWidth: 1.5, dash: dashed ? [8, 6] : []))
+        .shadow(color: .black.opacity(0.4), radius: 1)
     }
 }
 

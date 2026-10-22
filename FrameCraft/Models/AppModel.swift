@@ -107,6 +107,7 @@ final class AppModel {
 
     func startCamera() async {
         guard session == nil else { return }
+        camera.captureAspect = aspect.ratio
         camera.look.setRecipe(liveEdit)
         await camera.start()
         if camera.isRunning { zoom = camera.setZoom(1) }
@@ -129,11 +130,14 @@ final class AppModel {
         switch mode {
         case .auto:
             camera.isComposing = false
-            if camera.isRunning, camera.frame == nil { camera.startScan() }
+            camera.dismissScan()
+            camera.startCoaching()
         case .custom:
+            camera.stopCoaching()
             camera.dismissScan()
             camera.isComposing = true
         case .photo:
+            camera.stopCoaching()
             camera.dismissScan()
             camera.isComposing = false
         }
@@ -163,7 +167,7 @@ final class AppModel {
         case .level: showLevel
         case .format: false
         case .torch: camera.torch
-        case .scan: camera.scan != .idle
+        case .scan: camera.isCoaching || camera.scan != .idle
         case .custom: camera.isComposing || camera.frame != nil
         case .manual: showManualControls || !camera.manual.isAuto
         case .raw: camera.rawMode != .off
@@ -207,7 +211,7 @@ final class AppModel {
         case .grid: gridStyle.label
         case .level, .torch: isActive(control) ? "On" : "Off"
         case .format: valueText(for: .format) ?? ""
-        case .scan: camera.scanResult.map { $0.isConclusive ? "Suggestion ready" : "No clear suggestion" } ?? "Off"
+        case .scan: camera.isCoaching ? (camera.coachAdvice?.isAligned == true ? "Framed" : "Guiding") : "Off"
         case .custom: camera.frame == nil ? "No frame" : (camera.alignment?.isAligned == true ? "Aligned" : "Frame set")
         case .manual: camera.manual.isAuto ? "Auto" : "Manual"
         case .raw: camera.rawMode.label
@@ -224,7 +228,7 @@ final class AppModel {
         case .level: "Shows a level that follows your phone's tilt"
         case .format: "HEIF (smaller, 10-bit) or JPEG for new photos"
         case .torch: "Keeps the flashlight on while you frame"
-        case .scan: "Analyzes the scene and suggests a framing, with measured exposure and level notes"
+        case .scan: "AUTO FRAME: live guidance to a well-framed shot (move, tilt, zoom), with measured exposure and level notes"
         case .custom: "Draw your own frame and tap a subject to see when it lines up"
         case .manual: "ISO, shutter speed, focus and white balance, where this camera supports them"
         case .raw: "Also captures a RAW or Apple ProRAW original, where this iPhone supports it"
@@ -237,6 +241,7 @@ final class AppModel {
         case .timer: timer = timer.next
         case .aspect:
             aspect = aspect.next
+            camera.captureAspect = aspect.ratio
             camera.composeAspect = camera.composeAspect == nil ? nil : aspect
         case .exposure: isExposureDialVisible.toggle()
         case .grid:
@@ -251,8 +256,8 @@ final class AppModel {
         case .torch: camera.setTorch(!camera.torch)
         case .scan:
             isControlPanelOpen = false
-            mode = .auto
-            camera.startScan()
+            mode = mode == .auto ? .photo : .auto
+            modeChanged()
         case .custom:
             isControlPanelOpen = false
             mode = .custom
@@ -267,6 +272,12 @@ final class AppModel {
 
     func setZoom(_ value: CGFloat) {
         zoom = camera.setZoom(ZoomLimits.clamp(value))
+    }
+
+    /// The coach's "SET ZOOM": zooms smoothly to the suggested framing.
+    func applyCoachZoom() {
+        guard let target = camera.coachAdvice?.zoomTo else { return }
+        withAnimation(.spring(duration: 0.35)) { zoom = camera.setZoom(target, animated: true) }
     }
 
     var zoomPresets: [CGFloat] { camera.isRunning ? camera.capabilities.zoomPresets : [1] }
