@@ -55,6 +55,13 @@ struct CameraScreen: View {
             }
             .zIndex(1)
 
+            if let hold = app.holdStill {
+                HoldStillBadge(label: hold.label, start: hold.start, seconds: hold.seconds)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .allowsHitTesting(false)
+                    .zIndex(2)
+            }
+
             if let seconds = app.countdown {
                 Text("\(seconds)")
                     .font(.system(size: 96, weight: .light).monospacedDigit())
@@ -107,11 +114,6 @@ private struct StatusRow: View {
             .disabled(!app.isAvailable(.flash))
             .opacity(app.isAvailable(.flash) ? 1 : 0.4)
 
-            item("viewfinder", active: app.camera.isCoaching, label: "Auto frame", value: app.camera.isCoaching ? "On" : "Off") {
-                app.perform(.scan)
-            }
-            .disabled(!app.camera.isRunning)
-
             Button {
                 app.isExposureDialVisible = true
                 app.isControlPanelOpen = true
@@ -132,6 +134,20 @@ private struct StatusRow: View {
                 app.closePopUps()
                 app.showLookPicker = true
             }
+
+            Button {
+                let open = !app.isControlPanelOpen
+                app.closePopUps()
+                app.isExposureDialVisible = false
+                app.isControlPanelOpen = open
+            } label: {
+                SixDotGlyph()
+                    .foregroundStyle(app.isControlPanelOpen ? Color.yellow : .white)
+                    .rotatesWithDevice()
+                    .frame(minWidth: 36, minHeight: 36)
+                    .contentShape(Rectangle())
+            }
+            .accessibilityLabel("More controls")
         }
         .buttonStyle(PressableButtonStyle())
         .shadow(color: .black.opacity(0.45), radius: 2)
@@ -160,8 +176,22 @@ private struct ShutterControls: View {
     @State private var dialStartZoom: CGFloat?
 
     var body: some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 12) {
             LiveCompositionArea(app: app)
+
+            if app.camera.isRunning {
+                ExposureStrip(app: app)
+            }
+
+            let status = app.statusLine
+            Text(status.text)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(status.style == .good ? Color.green : status.style == .working ? Color.yellow : .white.opacity(0.55))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+                .shadow(color: .black.opacity(0.6), radius: 2)
+                .animation(.easeOut(duration: 0.2), value: status.text)
+                .accessibilityAddTraits(.updatesFrequently)
 
             if app.camera.isRunning {
                 zoomArea
@@ -180,18 +210,7 @@ private struct ShutterControls: View {
                 ShutterButton(app: app)
                 Spacer()
 
-                RingedCircleButton(isActive: app.isControlPanelOpen, label: "More controls",
-                                   value: app.isControlPanelOpen ? "Expanded" : "Collapsed",
-                                   hint: "Flash, timer, aspect, exposure, grid, scan, custom frame, manual and RAW") {
-                    withAnimation(reduceMotion ? nil : .spring(duration: 0.4, bounce: 0.18)) {
-                        app.isExposureDialVisible = false
-                        let open = !app.isControlPanelOpen
-                        app.closePopUps()
-                        app.isControlPanelOpen = open
-                    }
-                } content: {
-                    SixDotGlyph()
-                }
+                ScanButton(app: app)
             }
             .padding(.horizontal, 32)
         }
@@ -295,6 +314,57 @@ private struct BottomBar: View {
             .frame(width: proxy.size.width, height: proxy.size.height)
         }
         .frame(height: 70)
+    }
+}
+
+/// ✦ scans the scene, ✕ stops a scan in progress, ↻ scans again once it has told you what to do.
+private struct ScanButton: View {
+    @Bindable var app: AppModel
+
+    var body: some View {
+        let phase = app.camera.scanPhase
+        let busy = phase == .finding || { if case .framing = phase { return true } else { return false } }()
+        Button { app.scanButtonTapped() } label: {
+            Image(systemName: busy ? "xmark" : (phase == .guiding ? "arrow.clockwise" : "sparkles"))
+                .font(.system(size: busy ? 17 : 20, weight: .semibold))
+                .foregroundStyle(busy ? Color.white : .yellow)
+                .contentTransition(.symbolEffect(.replace))
+                .frame(width: 48, height: 48)
+                .background(Circle().fill(busy ? Color.white.opacity(0.12) : Color.yellow.opacity(0.18)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(PressableButtonStyle())
+        .cameraGlass(.interactive, in: Circle())
+        .disabled(!app.camera.isRunning)
+        .accessibilityLabel(busy ? "Stop scanning" : (phase == .guiding ? "Scan again" : "Scan the scene"))
+        .accessibilityHint("Finds a framing, zooms to it, names the subject and says what to do")
+    }
+}
+
+/// "Hold still · 1″" with a bar that fills while a long exposure is being taken.
+private struct HoldStillBadge: View {
+    let label: String
+    let start: Date
+    let seconds: Double
+
+    var body: some View {
+        TimelineView(.animation) { context in
+            let progress = min(1, context.date.timeIntervalSince(start) / max(seconds, 0.01))
+            VStack(spacing: 8) {
+                Text(label).font(.subheadline.weight(.semibold)).foregroundStyle(.white)
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(.white.opacity(0.25))
+                        Capsule().fill(Color.yellow).frame(width: proxy.size.width * progress)
+                    }
+                }
+                .frame(width: 140, height: 3)
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+            .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+        .accessibilityLabel(label)
     }
 }
 

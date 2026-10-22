@@ -99,23 +99,21 @@ enum CaptureAspect: String, CaseIterable, Codable, Identifiable, Sendable {
     }
 }
 
-/// Modes in the bottom carousel. AUTO scans the scene and suggests a frame, PHOTO is a plain camera,
-/// CUSTOM lets you draw your own frame and track a subject.
+/// Modes in the bottom carousel. PHOTO is the camera (✦ scans for a framing); CUSTOM lets you draw your own
+/// frame and track a subject.
 enum CameraMode: String, CaseIterable, Identifiable {
-    case auto, photo, custom
+    case photo, custom
 
     var id: String { rawValue }
     var title: String {
         switch self {
-        case .auto: "AUTO FRAME"
         case .photo: "PHOTO"
         case .custom: "CUSTOM"
         }
     }
     var explanation: String {
         switch self {
-        case .auto: "Scans the scene and suggests a framing you can apply before taking the photo."
-        case .photo: "A plain camera with your chosen look."
+        case .photo: "The camera. Tap the sparkle button to scan the scene for a framing."
         case .custom: "Draw your own frame and tap a subject to see when it lines up."
         }
     }

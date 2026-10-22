@@ -80,10 +80,11 @@ final class AppModel {
     @ObservationIgnored private var toastTask: Task<Void, Never>?
 
     init(store: ProjectStore? = .standard, defaults: UserDefaults = .standard) {
+        defer { camera.onAutoZoom = { [weak self] value in self?.zoom = value } }
         self.store = store
         self.defaults = defaults
         gridStyle = GridStyle(rawValue: defaults.string(forKey: SettingsKey.gridStyle) ?? "") ?? .thirds
-        showLevel = defaults.bool(forKey: SettingsKey.showLevel)
+        showLevel = defaults.object(forKey: SettingsKey.showLevel) as? Bool ?? true
         captureHEIF = defaults.object(forKey: SettingsKey.captureFormat) as? Bool ?? true
     }
 
@@ -94,7 +95,6 @@ final class AppModel {
         showLookPicker = false
         if showManualControls {
             showManualControls = false
-            camera.watchReadings(false)
         }
     }
 
@@ -125,23 +125,47 @@ final class AppModel {
 
     // MARK: Modes
 
-    /// AUTO scans right away, CUSTOM enters frame drawing, PHOTO is a plain camera.
+    /// CUSTOM enters frame drawing (and ends a scan); PHOTO is the camera.
     func modeChanged() {
         switch mode {
-        case .auto:
-            camera.isComposing = false
-            camera.dismissScan()
-            camera.startCoaching()
         case .custom:
-            camera.stopCoaching()
+            camera.cancelAutoScan()
             camera.dismissScan()
             camera.isComposing = true
         case .photo:
-            camera.stopCoaching()
             camera.dismissScan()
             camera.isComposing = false
         }
     }
+
+    /// ✦ starts a scan, ✕ cancels one in progress, ↻ scans again.
+    func scanButtonTapped() {
+        switch camera.scanPhase {
+        case .finding, .framing: camera.cancelAutoScan()
+        case .idle, .guiding:
+            if mode != .photo { mode = .photo; modeChanged() }
+            camera.startAutoScan()
+        }
+    }
+
+    /// The line under the exposure strip: what the scan is doing, its instruction, or how to start one.
+    var statusLine: (text: String, style: StatusStyle) {
+        switch camera.scanPhase {
+        case .finding: return ("Finding your shot…", .working)
+        case .framing(let text): return (text, .good)
+        case .guiding:
+            if camera.coachAdvice?.isAligned == true { return ("Framed — take the shot", .good) }
+            return (camera.instruction ?? "", .good)
+        case .idle:
+            if mode == .custom { return ("Drag to draw a frame · tap a subject to track it", .neutral) }
+            return ("Tap ✦ to scan a new scene", .neutral)
+        }
+    }
+
+    enum StatusStyle { case neutral, working, good }
+
+    /// Long exposures: "Hold still · 1″" with progress while the shutter is open.
+    private(set) var holdStill: (label: String, start: Date, seconds: Double)?
 
     // MARK: Controls
 
@@ -167,7 +191,7 @@ final class AppModel {
         case .level: showLevel
         case .format: false
         case .torch: camera.torch
-        case .scan: camera.isCoaching || camera.scan != .idle
+        case .scan: camera.scanPhase != .idle
         case .custom: camera.isComposing || camera.frame != nil
         case .manual: showManualControls || !camera.manual.isAuto
         case .raw: camera.rawMode != .off
@@ -211,7 +235,7 @@ final class AppModel {
         case .grid: gridStyle.label
         case .level, .torch: isActive(control) ? "On" : "Off"
         case .format: valueText(for: .format) ?? ""
-        case .scan: camera.isCoaching ? (camera.coachAdvice?.isAligned == true ? "Framed" : "Guiding") : "Off"
+        case .scan: camera.scanPhase == .idle ? "Off" : (camera.coachAdvice?.isAligned == true ? "Framed" : "Guiding")
         case .custom: camera.frame == nil ? "No frame" : (camera.alignment?.isAligned == true ? "Aligned" : "Frame set")
         case .manual: camera.manual.isAuto ? "Auto" : "Manual"
         case .raw: camera.rawMode.label
@@ -256,8 +280,7 @@ final class AppModel {
         case .torch: camera.setTorch(!camera.torch)
         case .scan:
             isControlPanelOpen = false
-            mode = mode == .auto ? .photo : .auto
-            modeChanged()
+            scanButtonTapped()
         case .custom:
             isControlPanelOpen = false
             mode = .custom
@@ -265,7 +288,6 @@ final class AppModel {
         case .manual:
             isControlPanelOpen = false
             showManualControls = true
-            camera.watchReadings(true)
         case .raw: camera.cycleRaw()
         }
     }
@@ -392,8 +414,11 @@ final class AppModel {
         edit.cropRect = crop.width > 0.995 && crop.height > 0.995 ? EditState.fullCrop : crop
         let heif = captureHEIF
         let flash = self.flash
+        let seconds = camera.manual.shutterSeconds ?? camera.readings?.seconds ?? 0
+        if seconds >= 0.1 { holdStill = ("Hold still · " + ExposureStops.shutterLabel(seconds), Date(), seconds) }
         Task { [weak self, edit] in
             guard let self else { return }
+            defer { self.holdStill = nil }
             do {
                 let shot = try await self.camera.capture(flash: flash, heif: heif)
                 self.flashPulse += 1
@@ -412,10 +437,15 @@ final class AppModel {
         let isRAW = shot.rawData != nil
         let source: PhotoProject.Source = !isRAW ? .camera : (shot.rawKind == .proRAW ? .cameraProRAW : .cameraRAW)
         do {
-            let project = try await Task.detached(priority: .userInitiated) {
-                try store.create(original: shot.rawData ?? shot.processedData,
-                                 typeIdentifier: isRAW ? "com.adobe.raw-image" : shot.processedType,
-                                 source: source, companion: isRAW ? shot.processedData : nil, edit: edit)
+            let project = try await Task.detached(priority: .userInitiated) { () -> PhotoProject in
+                // Opens already edited: the look, a measured correction and a little grain (all adjustable).
+                var auto = edit
+                if let preview = EditSession.makePreview(shot.processedData, maxPixel: 256) {
+                    auto = AutoEdit.suggest(luma: AutoEdit.lumaSamples(preview), base: edit)
+                }
+                return try store.create(original: shot.rawData ?? shot.processedData,
+                                        typeIdentifier: isRAW ? "com.adobe.raw-image" : shot.processedType,
+                                        source: source, companion: isRAW ? shot.processedData : nil, edit: auto)
             }.value
             await open(project)
         } catch {

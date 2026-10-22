@@ -40,6 +40,49 @@ enum RawCaptureMode: String, CaseIterable, Codable, Sendable {
     }
 }
 
+/// What the camera is doing right now. `offset` is the meter reading in stops: 0 is what the camera
+/// considers correct, negative is darker, positive brighter.
+struct CameraReadings: Equatable, Sendable {
+    var iso: Float
+    var seconds: Double
+    var lens: Float
+    var kelvin: Float
+    var offset: Float
+}
+
+/// Shutter speeds and ISO values for the exposure rulers (third stops, like a camera dial).
+enum ExposureStops {
+    static let shutterSeconds: [Double] = [
+        1.0 / 8000, 1.0 / 6400, 1.0 / 5000, 1.0 / 4000, 1.0 / 3200, 1.0 / 2500, 1.0 / 2000, 1.0 / 1600, 1.0 / 1250, 1.0 / 1000,
+        1.0 / 800, 1.0 / 640, 1.0 / 500, 1.0 / 400, 1.0 / 320, 1.0 / 250, 1.0 / 200, 1.0 / 160, 1.0 / 125, 1.0 / 100, 1.0 / 80,
+        1.0 / 60, 1.0 / 50, 1.0 / 40, 1.0 / 30, 1.0 / 25, 1.0 / 20, 1.0 / 15, 1.0 / 13, 1.0 / 10, 1.0 / 8, 1.0 / 6, 1.0 / 5,
+        1.0 / 4, 0.3, 0.4, 0.5, 0.6, 0.8, 1,
+    ]
+    static let isoValues: [Float] = [
+        25, 32, 40, 50, 64, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000,
+        6400, 8000, 10000, 12800,
+    ]
+
+    /// Labeled ticks on the rulers (whole stops).
+    static let shutterLabels: Set<Double> = [1.0 / 8000, 1.0 / 4000, 1.0 / 2000, 1.0 / 1000, 1.0 / 500, 1.0 / 250, 1.0 / 125,
+                                             1.0 / 60, 1.0 / 30, 1.0 / 15, 1.0 / 8, 1.0 / 4, 0.5, 1]
+    static let isoLabels: Set<Float> = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000]
+
+    static func shutters(in range: ClosedRange<Double>) -> [Double] {
+        shutterSeconds.filter { $0 >= range.lowerBound * 0.98 && $0 <= range.upperBound * 1.02 }
+    }
+
+    static func isos(in range: ClosedRange<Float>) -> [Float] {
+        isoValues.filter { $0 >= range.lowerBound * 0.98 && $0 <= range.upperBound * 1.02 }
+    }
+
+    /// "1/250", "0.5\"", "1\"" (the way camera dials write shutter speeds).
+    static func shutterLabel(_ s: Double) -> String {
+        if s >= 0.3 { return s >= 1 ? "\(Int(s.rounded()))\"" : String(format: "%.1f\"", s) }
+        return "1/\(Int((1 / s).rounded()))"
+    }
+}
+
 /// One capture's files. `rawData` is a real DNG from the sensor (Bayer RAW or Apple ProRAW), never a relabeled JPEG.
 struct CapturedPhoto: Sendable {
     let processedData: Data
@@ -357,13 +400,15 @@ final class CameraService: NSObject, @unchecked Sendable {
         }
     }
 
-    /// Live readouts for the manual controls.
-    func readings() async -> (iso: Float, seconds: Double, lens: Float, kelvin: Float)? {
+    /// Live readouts: what the camera is using now, and how far that is from its own meter.
+    func readings() async -> CameraReadings? {
         await withCheckedContinuation { continuation in
             sessionQueue.async { [self] in
                 guard let device else { continuation.resume(returning: nil); return }
                 let kelvin = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains).temperature
-                continuation.resume(returning: (device.iso, device.exposureDuration.seconds, device.lensPosition, kelvin))
+                continuation.resume(returning: CameraReadings(iso: device.iso, seconds: device.exposureDuration.seconds,
+                                                              lens: device.lensPosition, kelvin: kelvin,
+                                                              offset: device.exposureTargetOffset))
             }
         }
     }

@@ -39,6 +39,17 @@ struct EditState: Codable, Equatable, Sendable {
     var motionBlur: Double = 0
     var motionAngle: Double = 0
     var vignette: Double = 0
+    var fringe: Double = 0
+    /// Effect options: grain size (fine 0 ... coarse 1), light leak size, warmth (-1 cool ... +1 warm) and where
+    /// it comes in (0...1 of the photo, placed by dragging), halation spread.
+    var grainSize: Double = 0.4
+    var leakSize: Double = 0.5
+    var leakWarmth: Double = 0.5
+    var leakX: Double = 0
+    var leakY: Double = 0.3
+    var halationSpread: Double = 0.5
+    /// Shuffle: which pattern of dust, scratches and second leak to use.
+    var effectSeed: Int = 0
 
     // Geometry: crop (normalized, top-left origin, on the upright photo after rotation), quarter turns clockwise,
     // straighten in degrees.
@@ -73,6 +84,13 @@ struct EditState: Codable, Equatable, Sendable {
         curves = (try? c.decodeIfPresent(ToneCurves.self, forKey: .curves)) ?? ToneCurves()
         calibration = (try? c.decodeIfPresent(ColorCalibration.self, forKey: .calibration)) ?? ColorCalibration()
         motionAngle = number(.motionAngle, -90...90, 0)
+        grainSize = number(.grainSize, 0...1, 0.4)
+        leakSize = number(.leakSize, 0...1, 0.5)
+        leakWarmth = number(.leakWarmth, -1...1, 0.5)
+        leakX = number(.leakX, 0...1, 0)
+        leakY = number(.leakY, 0...1, 0.3)
+        halationSpread = number(.halationSpread, 0...1, 0.5)
+        effectSeed = (try? c.decodeIfPresent(Int.self, forKey: .effectSeed)) ?? 0
         let crop = (try? c.decodeIfPresent(CGRect.self, forKey: .cropRect)) ?? Self.fullCrop
         cropRect = Self.fullCrop.insetBy(dx: -0.0001, dy: -0.0001).contains(crop) && crop.width > 0.02 && crop.height > 0.02
             ? crop : Self.fullCrop
@@ -104,6 +122,13 @@ struct EditState: Codable, Equatable, Sendable {
             next.calibration = d.calibration
         case .effects:
             next.motionAngle = d.motionAngle
+            next.grainSize = d.grainSize
+            next.leakSize = d.leakSize
+            next.leakWarmth = d.leakWarmth
+            next.leakX = d.leakX
+            next.leakY = d.leakY
+            next.halationSpread = d.halationSpread
+            next.effectSeed = d.effectSeed
         case .crop:
             next.cropRect = d.cropRect
             next.rotation = d.rotation
@@ -124,7 +149,7 @@ enum EditGroup: String, CaseIterable, Identifiable, Sendable {
 enum EditParameter: String, CaseIterable, Identifiable, Sendable {
     case exposure, contrast, highlights, shadows, whites, blacks, fade, temperature, tint
     case saturation, vibrance
-    case grain, halation, glow, lightLeak, dust, scratches, motionBlur, vignette
+    case grain, halation, glow, lightLeak, dust, scratches, motionBlur, vignette, fringe
 
     var id: String { rawValue }
     var storageKey: String { rawValue }
@@ -141,14 +166,14 @@ enum EditParameter: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .exposure, .contrast, .highlights, .shadows, .whites, .blacks, .fade, .temperature, .tint: .light
         case .saturation, .vibrance: .color
-        case .grain, .halation, .glow, .lightLeak, .dust, .scratches, .motionBlur, .vignette: .effects
+        case .grain, .halation, .glow, .lightLeak, .dust, .scratches, .motionBlur, .vignette, .fringe: .effects
         }
     }
 
     var range: ClosedRange<Double> {
         switch self {
         case .exposure: -2...2
-        case .fade, .grain, .halation, .glow, .lightLeak, .dust, .scratches, .motionBlur: 0...1
+        case .fade, .grain, .halation, .glow, .lightLeak, .dust, .scratches, .motionBlur, .fringe: 0...1
         default: -1...1
         }
     }
@@ -176,6 +201,7 @@ enum EditParameter: String, CaseIterable, Identifiable, Sendable {
         case .scratches: \.scratches
         case .motionBlur: \.motionBlur
         case .vignette: \.vignette
+        case .fringe: \.fringe
         }
     }
 
@@ -199,7 +225,8 @@ enum EditParameter: String, CaseIterable, Identifiable, Sendable {
         case .dust: "aqi.medium"
         case .scratches: "scribble"
         case .motionBlur: "wind"
-        case .vignette: "camera.aperture"
+        case .vignette: "circle.dashed"
+        case .fringe: "circle.lefthalf.striped.horizontal"
         }
     }
 

@@ -34,7 +34,7 @@ final class LiveCameraModel {
     private(set) var isCapturing = false
     private(set) var exposureBias: Float = 0
     private(set) var manual = ManualSettings()
-    private(set) var readings: (iso: Float, seconds: Double, lens: Float, kelvin: Float)?
+    private(set) var readings: CameraReadings?
     private(set) var torch = false
     private(set) var rawMode: RawCaptureMode = RawCaptureMode(rawValue: UserDefaults.standard.string(forKey: SettingsKey.rawMode) ?? "") ?? .off
 
@@ -61,7 +61,21 @@ final class LiveCameraModel {
     private(set) var imageAspect: CGFloat = 3.0 / 4.0
     private var pendingSubjectTap: CGPoint?
 
-    // Live framing coach (AUTO FRAME)
+    // Scan (the ✦ button): finding → framing (zooms itself) → guiding with a named subject and an instruction.
+    enum ScanPhase: Equatable {
+        case idle, finding
+        case framing(String)
+        case guiding
+    }
+    private(set) var scanPhase: ScanPhase = .idle
+    private(set) var subjectTag: String?
+    private(set) var instruction: String?
+    /// Zoom the scan chose, so the zoom buttons follow it.
+    @ObservationIgnored var onAutoZoom: (@MainActor (CGFloat) -> Void)?
+    @ObservationIgnored private var stablePlans = 0
+    @ObservationIgnored private var scanTask: Task<Void, Never>?
+
+    // Live framing coach
     private(set) var isCoaching = false
     private(set) var coachPlan: FramingPlan?
     private(set) var coachAdvice: CoachAdvice?
@@ -116,6 +130,7 @@ final class LiveCameraModel {
             capabilities = try await service.start(position: position)
             status = .running
             if isCoaching { frames.setLive(interval: 0.2) }
+            watchReadings(true)
             if !supportsAnyRAW { setRaw(.off) } else if rawMode == .proRAW, !capabilities.supportsProRAW { setRaw(.raw) }
             reapplyManual()
         } catch {
@@ -181,17 +196,44 @@ final class LiveCameraModel {
         service.setTorch(on)
     }
 
-    /// Polls ISO, shutter, lens and white balance while the manual controls are open.
+    /// Polls ISO, shutter, lens, white balance and the meter reading while the camera runs (the exposure strip
+    /// shows them all the time).
     func watchReadings(_ on: Bool) {
         readingsTask?.cancel()
         guard on else { return }
         readingsTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                self.readings = await self.service.readings()
-                try? await Task.sleep(for: .milliseconds(400))
+                let next = await self.service.readings()
+                if next != self.readings { self.readings = next }
+                try? await Task.sleep(for: .milliseconds(250))
             }
         }
+    }
+
+    /// Exposure strip: manual shutter and/or ISO (nil = automatic for that one).
+    var isAutoExposure: Bool { manual.iso == nil && manual.shutterSeconds == nil }
+
+    func setShutter(_ seconds: Double?) {
+        var next = manual
+        next.shutterSeconds = seconds
+        // Going manual on one keeps the other where the camera has it now, so the picture doesn't jump.
+        if seconds != nil, next.iso == nil, let iso = readings?.iso { next.iso = iso }
+        setManual(next)
+    }
+
+    func setISO(_ iso: Float?) {
+        var next = manual
+        next.iso = iso
+        if iso != nil, next.shutterSeconds == nil, let s = readings?.seconds { next.shutterSeconds = s }
+        setManual(next)
+    }
+
+    func setAutoExposure() {
+        var next = manual
+        next.iso = nil
+        next.shutterSeconds = nil
+        setManual(next)
     }
 
     func cycleRaw() {
@@ -207,6 +249,71 @@ final class LiveCameraModel {
         isCoaching = true
         coachMargin = 0.08
         if isRunning { frames.setLive(interval: 0.2) }
+    }
+
+    /// ✦: scans the scene, settles on a framing, zooms to it, names the subject and says what to do.
+    func startAutoScan() {
+        scanTask?.cancel()
+        isComposing = false
+        dismissScan()
+        clearFrame()
+        subjectTag = nil
+        instruction = nil
+        stablePlans = 0
+        coachPlan = nil
+        coachAdvice = nil
+        scanPhase = .finding
+        startCoaching()
+    }
+
+    /// ✕ while scanning, or leaving the scan.
+    func cancelAutoScan() {
+        scanTask?.cancel()
+        scanPhase = .idle
+        subjectTag = nil
+        instruction = nil
+        stopCoaching()
+    }
+
+    private func beginFraming(_ plan: FramingPlan, advice: CoachAdvice) {
+        if let zoomTo = advice.zoomTo {
+            scanPhase = .framing("Framing your shot…")
+            let applied = setZoom(zoomTo, animated: true)
+            onAutoZoom?(applied)
+        } else {
+            scanPhase = .framing("Centered — framing up…")
+        }
+        scanTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(900)) // let the zoom settle before naming what's in frame
+            guard let self, !Task.isCancelled, let plan = self.coachPlan, let buffer = self.frames.latestBuffer() else { return }
+            let view = self.viewContext
+            let box = self.subjectBox(plan)
+            let facts = await Task.detached(priority: .userInitiated) { () -> ShotDirector.Facts in
+                let subject = ShotDirector.labels(in: buffer, region: box, count: 1).first
+                let scene = ShotDirector.labels(in: buffer, count: 1).first
+                let name = subject ?? (plan.kind == .landscape ? "horizon" : plan.kind == .subject ? "subject" : "person")
+                let contrast = box.map { ShotDirector.contrast(in: buffer, region: $0) } ?? 0
+                let fill = box.map { Double(($0.width * $0.height) / max(view.visible.width * view.visible.height, 0.0001)) } ?? 0
+                return ShotDirector.Facts(subject: name, scene: scene, kind: plan.kind, contrast: contrast, fill: fill,
+                                          anchorX: plan.anchor.x, horizonTarget: plan.horizonTarget, facing: 0)
+            }.value
+            guard !Task.isCancelled else { return }
+            var withFacing = facts
+            withFacing.facing = self.lastFeatures.flatMap(CompositionEngine.primarySubject)?.facing ?? 0
+            self.subjectTag = plan.kind == .landscape ? nil : ShotDirector.tag(subject: facts.subject, scene: facts.scene)
+            let line = await ShotDirector.wordedInstruction(withFacing)
+            guard !Task.isCancelled else { return }
+            self.instruction = line
+            self.scanPhase = .guiding
+        }
+    }
+
+    /// The subject's box (image coordinates) behind a plan, for naming and contrast.
+    private func subjectBox(_ plan: FramingPlan) -> CGRect? {
+        guard plan.kind != .landscape, let features = lastFeatures, let subject = CompositionEngine.primarySubject(features) else { return nil }
+        if plan.kind == .subject { return subject.box }
+        // People: the whole person (the face alone would just be named "face").
+        return features.subjects.filter { $0.kind == .person }.max { $0.box.width * $0.box.height < $1.box.width * $1.box.height }?.box ?? subject.box
     }
 
     func stopCoaching() {
@@ -259,6 +366,11 @@ final class LiveCameraModel {
         let advice = FramingCoach.advice(for: plan, view: view, horizonNow: horizonNow)
         if advice.isAligned, coachAdvice?.isAligned != true { alignedPulse += 1 }
         coachAdvice = advice
+        if scanPhase == .finding {
+            // Settle on a framing that held for about a second before acting on it.
+            stablePlans += 1
+            if stablePlans >= 4 { beginFraming(plan, advice: advice) }
+        }
     }
 
     /// Fallback: crop the next photo to the best framing inside what the camera sees (no moving needed).

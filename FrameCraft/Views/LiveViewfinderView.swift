@@ -96,7 +96,7 @@ struct LiveViewfinderView: View {
             if camera.isCoaching, let advice = camera.coachAdvice {
                 CoachGuide(advice: advice,
                            idealFrame: camera.coachPlan.map { AspectFillMapping.toView($0.rect, imageAspect: aspect, viewSize: frame) },
-                           size: frame)
+                           size: frame, tag: camera.subjectTag, showFrame: camera.scanPhase == .guiding)
                     .transition(.opacity)
             }
             if let chosen = camera.frame {
@@ -268,11 +268,13 @@ private struct CoachGuide: View {
     let advice: CoachAdvice
     let idealFrame: CGRect?
     let size: CGSize
+    var tag: String?
+    var showFrame = true
 
     var body: some View {
         let target = CGPoint(x: advice.target.x * size.width, y: advice.target.y * size.height)
         ZStack {
-            if let idealFrame, !advice.isAligned {
+            if let idealFrame, showFrame, !advice.isAligned {
                 RoundedRectangle(cornerRadius: 4)
                     .stroke(.white.opacity(0.55), style: StrokeStyle(lineWidth: 1.2, dash: [6, 5]))
                     .frame(width: idealFrame.width, height: idealFrame.height)
@@ -286,20 +288,38 @@ private struct CoachGuide: View {
             }
             if let current = advice.current {
                 let here = CGPoint(x: current.x * size.width, y: current.y * size.height)
-                if !advice.isAligned {
+                if !advice.isAligned, hypot(here.x - target.x, here.y - target.y) > 24 {
                     Path { p in
                         p.move(to: here)
                         p.addLine(to: target)
                     }
-                    .stroke(.white.opacity(0.7), style: StrokeStyle(lineWidth: 1.5, dash: [4, 4]))
-                    Circle().fill(.white).frame(width: 10, height: 10).position(here).shadow(radius: 1)
+                    .stroke(.white.opacity(0.55), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
                 }
-                Circle()
-                    .strokeBorder(Color.yellow, lineWidth: advice.isAligned ? 3 : 2)
-                    .background(Circle().fill(Color.yellow.opacity(advice.isAligned ? 0.35 : 0)))
-                    .frame(width: advice.isAligned ? 52 : 44, height: advice.isAligned ? 52 : 44)
-                    .position(target)
-                    .shadow(color: .black.opacity(0.4), radius: 1)
+                // Where the subject should go: a cross on a short level-style line, green once it's there.
+                ZStack {
+                    Rectangle().fill(Color.yellow).frame(width: 120, height: 1.2)
+                    Rectangle().fill(advice.isAligned ? Color.green : Color.yellow).frame(width: 2, height: 16)
+                }
+                .position(target)
+                .shadow(color: .black.opacity(0.4), radius: 1)
+                // What and where the subject is.
+                if let tag {
+                    HStack(spacing: 6) {
+                        Circle().fill(Color.green).frame(width: 6, height: 6)
+                        Text(tag)
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(Color.green)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(.black.opacity(0.45), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .frame(maxWidth: 170)
+                    .position(x: min(max(here.x, 90), size.width - 90), y: min(here.y + 44, size.height - 20))
+                } else {
+                    Circle().fill(.white).frame(width: 8, height: 8).position(here).shadow(radius: 1)
+                }
             }
         }
         .animation(.easeOut(duration: 0.2), value: advice)

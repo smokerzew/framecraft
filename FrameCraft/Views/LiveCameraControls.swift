@@ -10,7 +10,7 @@ struct LiveCompositionArea: View {
     var body: some View {
         Group {
             if camera.isCoaching {
-                CoachCard(app: app)
+                EmptyView() // the scan speaks through the status line and the viewfinder marks
             } else if camera.scan == .scanning {
                 CameraTag(text: "ANALYZING SCENE…", isOff: true)
             } else if let result = camera.scanResult {

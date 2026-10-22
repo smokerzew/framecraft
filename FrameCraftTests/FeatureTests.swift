@@ -552,3 +552,78 @@ final class FramingCoachTests: XCTestCase {
         XCTAssertGreaterThan(switched?.anchor.x ?? 0, 0.5, "a clearly better one does")
     }
 }
+
+final class ScanAndEditTests: XCTestCase {
+    func testAutoEditBrightensADarkPhotoAndAddsALook() {
+        let dark = (0..<400).map { Double($0 % 40) / 400 + 0.02 } // mostly deep shadows
+        let edit = AutoEdit.suggest(luma: dark, base: EditState())
+        XCTAssertGreaterThan(edit.exposure, 0.3)
+        XCTAssertGreaterThan(edit.shadows, 0)
+        XCTAssertEqual(edit.look, .clean, "opens with a look, like the reference")
+        XCTAssertGreaterThan(edit.grain, 0)
+        var chosen = EditState()
+        chosen.look = .silverTone
+        XCTAssertEqual(AutoEdit.suggest(luma: dark, base: chosen).look, .silverTone, "a look picked before shooting stays")
+        let even = (0..<400).map { 0.25 + Double($0 % 50) / 100 }
+        XCTAssertEqual(AutoEdit.suggest(luma: even, base: EditState()).exposure, 0, "a well exposed photo isn't pushed")
+    }
+
+    func testInstructionsFollowTheMeasuredScene() {
+        var f = ShotDirector.Facts(subject: "flower", scene: "bedroom", kind: .subject, contrast: 0.3, fill: 0.1,
+                                   anchorX: 1.0 / 3, horizonTarget: nil, facing: 0)
+        XCTAssertEqual(ShotDirector.instruction(f), "Isolate the flower against the dark background.")
+        f.contrast = -0.3
+        XCTAssertEqual(ShotDirector.instruction(f), "Silhouette the flower against the light.")
+        f.contrast = 0
+        XCTAssertEqual(ShotDirector.instruction(f), "Place the flower on the left third.")
+        f.kind = .landscape
+        f.horizonTarget = 1.0 / 3
+        XCTAssertEqual(ShotDirector.instruction(f), "Put the horizon on the upper third.")
+        f.kind = .waistUp
+        f.facing = 1
+        XCTAssertEqual(ShotDirector.instruction(f), "Frame them waist up, with room in front of their face.")
+        XCTAssertEqual(ShotDirector.tag(subject: "flower", scene: "bedroom"), "flower · bedroom")
+        XCTAssertEqual(ShotDirector.readable("flower_arrangement"), "flower arrangement")
+    }
+
+    func testModelWordingIsCleanedOrRejected() {
+        XCTAssertEqual(ShotDirector.clean("\"move closer to the vase\"\nextra"), "Move closer to the vase.")
+        XCTAssertNil(ShotDirector.clean("ok"))
+        XCTAssertNil(ShotDirector.clean(String(repeating: "a", count: 120)))
+    }
+
+    func testExposureStops() {
+        XCTAssertEqual(ExposureStops.shutterLabel(1), "1\"")
+        XCTAssertEqual(ExposureStops.shutterLabel(0.5), "0.5\"")
+        XCTAssertEqual(ExposureStops.shutterLabel(1.0 / 250), "1/250")
+        XCTAssertEqual(ExposureStops.isos(in: 50...3200).first, 50)
+        XCTAssertEqual(ExposureStops.isos(in: 50...3200).last, 3200)
+        XCTAssertTrue(ExposureStops.shutters(in: (1.0 / 1000)...1).contains(1.0 / 60))
+    }
+
+    func testEffectOptionsChangeTheResult() throws {
+        let renderer = PhotoRenderer.shared
+        let extent = CGRect(x: 0, y: 0, width: 96, height: 96)
+        let gray = CIImage(color: CIColor(red: 0.4, green: 0.4, blue: 0.4)).cropped(to: extent)
+        func png(_ e: EditState) throws -> Data {
+            let out = renderer.render(e, to: gray)
+            let cg = try XCTUnwrap(renderer.context.createCGImage(out, from: extent))
+            return try XCTUnwrap(renderer.context.pngRepresentation(of: CIImage(cgImage: cg), format: .RGBA8,
+                                                                    colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!))
+        }
+        var leak = EditState()
+        leak.lightLeak = 1
+        var moved = leak
+        moved.leakX = 1
+        moved.leakY = 1
+        XCTAssertNotEqual(try png(leak), try png(moved), "placing the leak moves it")
+        var cool = leak
+        cool.leakWarmth = -1
+        XCTAssertNotEqual(try png(leak), try png(cool), "warmth changes its color")
+        var dust = EditState()
+        dust.dust = 1
+        var shuffled = dust
+        shuffled.effectSeed = 42
+        XCTAssertNotEqual(try png(dust), try png(shuffled), "shuffle picks another pattern")
+    }
+}

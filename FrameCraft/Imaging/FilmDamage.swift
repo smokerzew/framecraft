@@ -5,7 +5,7 @@ import Foundation
 extension PhotoRenderer {
     /// Dust specks, hairs and long scratches like a scanned print. The marks come from a fixed sequence,
     /// so raising the slider adds marks instead of reshuffling them, and every render of the same photo matches.
-    func filmDamage(_ image: CIImage, dust: Double, scratches: Double, extent: CGRect) -> CIImage {
+    func filmDamage(_ image: CIImage, dust: Double, scratches: Double, seed: Int = 0, extent: CGRect) -> CIImage {
         guard dust > 0 || scratches > 0, extent.width > 8, extent.height > 8 else { return image }
         let scale = min(1, 2048 / max(extent.width, extent.height))
         let width = Int((extent.width * scale).rounded()), height = Int((extent.height * scale).rounded())
@@ -16,7 +16,7 @@ extension PhotoRenderer {
         ctx.setLineCap(.round)
 
         if dust > 0 {
-            var rng = SplitMix64(seed: 0xD057)
+            var rng = SplitMix64(seed: 0xD057 &+ UInt64(bitPattern: Int64(seed)) &* 0x9E37)
             let area = Double(w * h) / Double(s * s) // more marks on longer frames
             let count = Int(dust * 320 * area)
             for index in 0..<count {
@@ -45,7 +45,7 @@ extension PhotoRenderer {
         }
 
         if scratches > 0 {
-            var rng = SplitMix64(seed: 0x5C7A)
+            var rng = SplitMix64(seed: 0x5C7A &+ UInt64(bitPattern: Int64(seed)) &* 0x9E37)
             let count = Int((scratches * 7).rounded(.up))
             for _ in 0..<count {
                 var x = CGFloat.random(in: 0.05...0.95, using: &rng) * w

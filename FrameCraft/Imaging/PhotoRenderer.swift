@@ -79,14 +79,20 @@ final class PhotoRenderer: @unchecked Sendable {
         let e = image.extent
 
         if edit.motionBlur > 0 { image = motionBlur(image, amount: edit.motionBlur, degrees: edit.motionAngle, extent: e) }
+        if edit.fringe > 0 { image = fringe(image, amount: edit.fringe, extent: e) }
         if edit.glow > 0 { image = glow(image, amount: edit.glow, extent: e) }
         let halationAmount = min(1, edit.halation + lookHalation)
-        if halationAmount > 0 { image = halation(image, amount: halationAmount, extent: e) }
-        if edit.lightLeak > 0 { image = lightLeak(image, amount: edit.lightLeak, extent: e) }
+        if halationAmount > 0 { image = halation(image, amount: halationAmount, spread: edit.halationSpread, extent: e) }
+        if edit.lightLeak > 0 {
+            image = lightLeak(image, amount: edit.lightLeak, size: edit.leakSize, warmth: edit.leakWarmth,
+                              at: CGPoint(x: edit.leakX, y: edit.leakY), seed: edit.effectSeed, extent: e)
+        }
         if edit.vignette != 0 { image = vignette(image, amount: edit.vignette, extent: e) }
-        if edit.dust > 0 || edit.scratches > 0 { image = filmDamage(image, dust: edit.dust, scratches: edit.scratches, extent: e) }
+        if edit.dust > 0 || edit.scratches > 0 {
+            image = filmDamage(image, dust: edit.dust, scratches: edit.scratches, seed: edit.effectSeed, extent: e)
+        }
         let grainAmount = min(1, edit.grain + lookGrain)
-        if grainAmount > 0 { image = filmGrain(image, amount: grainAmount, extent: e) }
+        if grainAmount > 0 { image = filmGrain(image, amount: grainAmount, size: edit.grainSize, extent: e) }
         return image.cropped(to: e)
     }
 
@@ -253,9 +259,10 @@ final class PhotoRenderer: @unchecked Sendable {
     // MARK: Effects
 
     /// Monochrome film grain added equally to R, G and B in display space, strongest in midtones.
-    func filmGrain(_ image: CIImage, amount: Double, extent: CGRect) -> CIImage {
+    func filmGrain(_ image: CIImage, amount: Double, size: Double = 0.4, extent: CGRect) -> CIImage {
         guard amount > 0, let random = CIFilter.randomGenerator().outputImage, let kernel = Self.kernel("filmGrain") else { return image }
-        let cell = max(1, extent.width / 1100)
+        // Size 0 = fine (cells of width/1600), 1 = coarse (width/550).
+        let cell = max(1, extent.width / CGFloat(1600 - 1050 * min(max(size, 0), 1)))
         func octave(_ scale: CGFloat, offset: CGFloat) -> CIImage {
             random.transformed(by: CGAffineTransform(translationX: offset, y: offset * 0.6))
                 .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
@@ -270,10 +277,12 @@ final class PhotoRenderer: @unchecked Sendable {
     }
 
     /// Red-orange glow around bright lights, as light scatters back through the film base.
-    func halation(_ image: CIImage, amount: Double, extent: CGRect) -> CIImage {
+    func halation(_ image: CIImage, amount: Double, spread: Double = 0.5, extent: CGRect) -> CIImage {
         guard amount > 0, let sourceKernel = Self.kernel("halationSource"), let addKernel = Self.kernel("halationAdd"),
               let source = sourceKernel.apply(extent: extent, arguments: [image]) else { return image }
-        let wide = source.clampedToExtent().applyingGaussianBlur(sigma: Double(extent.width / 70)).cropped(to: extent)
+        // Spread 0 hugs the lights, 1 glows far around them.
+        let wide = source.clampedToExtent().applyingGaussianBlur(sigma: Double(extent.width) / (120 - 90 * min(max(spread, 0), 1)))
+            .cropped(to: extent)
         let tight = source.clampedToExtent().applyingGaussianBlur(sigma: Double(extent.width / 300)).cropped(to: extent)
         return addKernel.apply(extent: extent, arguments: [image, wide, tight, Float(0.9 * min(amount, 1))])?.cropped(to: extent) ?? image
     }
@@ -288,23 +297,56 @@ final class PhotoRenderer: @unchecked Sendable {
             .cropped(to: e)
     }
 
-    /// Warm orange and magenta light bleeding in from the edges, like a film camera with a light leak.
-    func lightLeak(_ image: CIImage, amount: Double, extent e: CGRect) -> CIImage {
-        let size = max(e.width, e.height)
+    /// Light bleeding in like a film camera with a leak: a main glow where you placed it (`at`, 0...1 from the
+    /// top-left), sized by `size`, warm orange (+warmth) to cool magenta-blue (-warmth), plus a fainter second
+    /// glow whose spot comes from `seed` (Shuffle).
+    func lightLeak(_ image: CIImage, amount: Double, size: Double = 0.5, warmth: Double = 0.5, at point: CGPoint = CGPoint(x: 0, y: 0.3),
+                   seed: Int = 0, extent e: CGRect) -> CIImage {
+        let span = max(e.width, e.height)
         let k = CGFloat(min(amount, 1))
-        func leak(_ x: CGFloat, _ y: CGFloat, _ r: CGFloat, _ g: CGFloat, _ b: CGFloat, _ radius: CGFloat) -> CIImage {
+        let w = CGFloat(min(max(warmth, -1), 1))
+        func leak(_ x: CGFloat, _ y: CGFloat, strength: CGFloat, radius: CGFloat) -> CIImage {
             let f = CIFilter.radialGradient()
-            f.center = CGPoint(x: x, y: y)
+            f.center = CGPoint(x: e.minX + x * e.width, y: e.maxY - y * e.height)
             f.radius0 = 0
             f.radius1 = Float(radius)
-            f.color0 = CIColor(red: r * k, green: g * k, blue: b * k)
+            // Warm: orange. Cool: magenta toward blue.
+            let r: CGFloat = w >= 0 ? 1 : 0.85 + 0.15 * w
+            let g: CGFloat = w >= 0 ? 0.25 + 0.25 * w : 0.15
+            let b: CGFloat = w >= 0 ? 0.25 - 0.18 * w : 0.45 - 0.4 * w
+            f.color0 = CIColor(red: r * k * strength, green: g * k * strength, blue: b * k * strength)
             f.color1 = CIColor(red: 0, green: 0, blue: 0)
             return (f.outputImage ?? CIImage(color: .black)).cropped(to: e)
         }
-        let orange = leak(e.minX, e.maxY - e.height * 0.3, 1, 0.45, 0.1, size * 0.6)
-        let pink = leak(e.maxX, e.minY + e.height * 0.2, 0.9, 0.15, 0.4, size * 0.45)
-        let warm = orange.applyingFilter("CIScreenBlendMode", parameters: [kCIInputBackgroundImageKey: image])
-        return pink.applyingFilter("CIScreenBlendMode", parameters: [kCIInputBackgroundImageKey: warm]).cropped(to: e)
+        var rng = SplitMix64(seed: UInt64(bitPattern: Int64(seed)) &+ 0x1EAC)
+        let radius = span * CGFloat(0.3 + 0.6 * min(max(size, 0), 1))
+        let main = leak(CGFloat(point.x), CGFloat(point.y), strength: 1, radius: radius)
+        let second = leak(CGFloat(Double.random(in: 0.6...1, using: &rng)), CGFloat(Double.random(in: 0...1, using: &rng)),
+                          strength: 0.55, radius: radius * 0.7)
+        let lit = main.applyingFilter("CIScreenBlendMode", parameters: [kCIInputBackgroundImageKey: image])
+        return second.applyingFilter("CIScreenBlendMode", parameters: [kCIInputBackgroundImageKey: lit]).cropped(to: e)
+    }
+
+    /// Lens fringe: red and blue drift apart toward the edges (chromatic aberration), green stays put.
+    func fringe(_ image: CIImage, amount: Double, extent e: CGRect) -> CIImage {
+        let k = CGFloat(min(amount, 1)) * 0.006
+        func scaled(_ s: CGFloat) -> CIImage {
+            image.clampedToExtent()
+                .transformed(by: CGAffineTransform(translationX: -e.midX, y: -e.midY).concatenating(CGAffineTransform(scaleX: s, y: s))
+                    .concatenating(CGAffineTransform(translationX: e.midX, y: e.midY)))
+                .cropped(to: e)
+        }
+        func only(_ img: CIImage, _ r: CGFloat, _ g: CGFloat, _ b: CGFloat, alpha: CGFloat) -> CIImage {
+            img.applyingFilter("CIColorMatrix", parameters: [
+                "inputRVector": CIVector(x: r, y: 0, z: 0, w: 0), "inputGVector": CIVector(x: 0, y: g, z: 0, w: 0),
+                "inputBVector": CIVector(x: 0, y: 0, z: b, w: 0), "inputAVector": CIVector(x: 0, y: 0, z: 0, w: alpha),
+            ])
+        }
+        let red = only(scaled(1 + k), 1, 0, 0, alpha: 0)
+        let green = only(image, 0, 1, 0, alpha: 1)
+        let blue = only(scaled(1 - k), 0, 0, 1, alpha: 0)
+        return red.applyingFilter("CIAdditionCompositing", parameters: [kCIInputBackgroundImageKey: green])
+            .applyingFilter("CIAdditionCompositing", parameters: [kCIInputBackgroundImageKey: blue]).cropped(to: e)
     }
 
     /// Directional motion blur across the whole frame (panning / camera-shake look).

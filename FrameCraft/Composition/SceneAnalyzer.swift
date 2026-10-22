@@ -270,6 +270,13 @@ final class FrameRouter: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// The newest camera frame itself (for naming the subject after a scan).
+    func latestBuffer() -> CVPixelBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+        return latest
+    }
+
     /// The newest frame as an image (filter tiles and the scan freeze frame).
     func latestImage(maxSide: CGFloat = 480) -> CGImage? {
         lock.lock()
