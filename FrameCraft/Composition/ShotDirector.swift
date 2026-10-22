@@ -129,7 +129,10 @@ enum ShotDirector {
             var px = [UInt8](repeating: 0, count: 4)
             PhotoRenderer.shared.context.render(output, toBitmap: &px, rowBytes: 4, bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
                                                 format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
-            return (0.2126 * Double(px[0]) + 0.7152 * Double(px[1]) + 0.0722 * Double(px[2])) / 255
+            let r: Double = 0.2126 * Double(px[0])
+            let g: Double = 0.7152 * Double(px[1])
+            let b: Double = 0.0722 * Double(px[2])
+            return (r + g + b) / 255
         }
         let inside = average(box)
         let whole = average(e)

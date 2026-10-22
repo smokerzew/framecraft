@@ -34,8 +34,14 @@ enum AutoEdit {
         var pixels = [UInt8](repeating: 0, count: side * side * 4)
         context.render(scaled, toBitmap: &pixels, rowBytes: side * 4, bounds: CGRect(x: 0, y: 0, width: side, height: side),
                        format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB))
-        return stride(from: 0, to: pixels.count, by: 4).map {
-            (0.2126 * Double(pixels[$0]) + 0.7152 * Double(pixels[$0 + 1]) + 0.0722 * Double(pixels[$0 + 2])) / 255
+        var samples: [Double] = []
+        samples.reserveCapacity(side * side)
+        for i in stride(from: 0, to: pixels.count, by: 4) {
+            let r: Double = 0.2126 * Double(pixels[i])
+            let g: Double = 0.7152 * Double(pixels[i + 1])
+            let b: Double = 0.0722 * Double(pixels[i + 2])
+            samples.append((r + g + b) / 255)
         }
+        return samples
     }
 }
