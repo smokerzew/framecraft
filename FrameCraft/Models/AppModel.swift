@@ -152,7 +152,7 @@ final class AppModel {
     var statusLine: (text: String, style: StatusStyle) {
         switch camera.scanPhase {
         case .finding: return ("Finding your shot…", .working)
-        case .framing(let text): return (text, .good)
+        case .framing(let text): return (text, camera.framingBox != nil ? .working : .good) // yellow while the box shows
         case .guiding:
             if camera.coachAdvice?.isAligned == true { return ("Framed — take the shot", .good) }
             return (camera.instruction ?? "", .good)
@@ -402,9 +402,10 @@ final class AppModel {
         countdown = nil
     }
 
-    /// The crop the next photo gets: an applied suggestion or custom frame, else what the aspect shows.
+    /// The crop the next photo gets: an applied suggestion or custom frame, the scan's crop, else what the aspect shows.
     var captureCrop: CGRect {
         if let frame = camera.frame { return frame }
+        if camera.viewCrop != nil { return camera.viewContext.visible }
         return AspectFillMapping.visibleRect(imageAspect: camera.imageAspect, viewSize: CGSize(width: aspect.ratio, height: 1))
     }
 

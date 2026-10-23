@@ -8,6 +8,8 @@ import SwiftUI
 struct CameraPreviewView: UIViewRepresentable {
     let session: AVCaptureSession
     let look: LiveLookRenderer
+    /// The scan's crop (0...1 of the view), blown up to fill the view; nil shows everything.
+    var crop: CGRect?
     var onLayer: (AVCaptureVideoPreviewLayer) -> Void
 
     final class PreviewView: UIView {
@@ -21,23 +23,55 @@ struct CameraPreviewView: UIViewRepresentable {
         }
     }
 
-    func makeUIView(context: Context) -> PreviewView {
-        let view = PreviewView()
+    /// Holds the preview and scales it so the crop fills the frame SwiftUI gives it (a view SwiftUI sizes
+    /// itself shouldn't carry a transform).
+    final class CropView: UIView {
+        let preview = PreviewView()
+        var crop: CGRect?
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            preview.transform = .identity
+            preview.frame = bounds
+            preview.transform = Self.transform(for: crop, size: bounds.size)
+        }
+
+        /// Scales about the center so `crop` fills the view.
+        static func transform(for crop: CGRect?, size: CGSize) -> CGAffineTransform {
+            guard let c = crop, c.width > 0 else { return .identity }
+            let s = 1 / c.width
+            return CGAffineTransform(translationX: (0.5 - c.midX) * size.width * s, y: (0.5 - c.midY) * size.height * s)
+                .scaledBy(x: s, y: s)
+        }
+    }
+
+    func makeUIView(context: Context) -> CropView {
+        let container = CropView()
+        container.clipsToBounds = true
+        container.backgroundColor = .black
+        container.isUserInteractionEnabled = false
+        let view = container.preview
         view.backgroundColor = .black
         view.previewLayer.session = session
         view.previewLayer.videoGravity = .resizeAspectFill
         if let connection = view.previewLayer.connection, connection.isVideoRotationAngleSupported(90) {
             connection.videoRotationAngle = 90
         }
-        view.isUserInteractionEnabled = false
         look.attach(view.lookView)
         view.addSubview(view.lookView)
+        container.addSubview(view)
         onLayer(view.previewLayer)
-        return view
+        return container
     }
 
-    func updateUIView(_ view: PreviewView, context: Context) {
+    func updateUIView(_ container: CropView, context: Context) {
+        let view = container.preview
         if view.previewLayer.session !== session { view.previewLayer.session = session }
+        if container.crop != crop {
+            container.crop = crop
+            let next = CropView.transform(for: crop, size: container.bounds.size)
+            UIView.animate(withDuration: 0.5, delay: 0, options: [.curveEaseInOut, .beginFromCurrentState]) { view.transform = next }
+        }
         if let connection = view.previewLayer.connection, connection.isVideoRotationAngleSupported(90),
            connection.videoRotationAngle != 90 {
             connection.videoRotationAngle = 90

@@ -29,7 +29,7 @@ struct LiveViewfinderView: View {
     var body: some View {
         let frame = FramingGeometry.frameSize(ratio: app.aspect.ratio, in: size)
         ZStack {
-            CameraPreviewView(session: camera.service.session, look: camera.look) { layer in
+            CameraPreviewView(session: camera.service.session, look: camera.look, crop: camera.viewCrop) { layer in
                 camera.previewLayer = layer
             }
             .opacity(camera.isRunning || isPaused ? 1 : 0)
@@ -75,9 +75,18 @@ struct LiveViewfinderView: View {
 
     // MARK: Overlays
 
+    /// An image rect where it shows in the viewfinder (after the scan's crop, if any).
+    private func onScreen(_ rect: CGRect, frame: CGSize) -> CGRect {
+        ViewCrop.cropped(AspectFillMapping.toView(rect, imageAspect: camera.imageAspect, viewSize: frame), crop: camera.viewCrop, size: frame)
+    }
+
+    private func onScreen(_ point: CGPoint, frame: CGSize) -> CGPoint {
+        let r = onScreen(CGRect(origin: point, size: .zero), frame: frame)
+        return CGPoint(x: r.minX, y: r.minY)
+    }
+
     @ViewBuilder
     private func overlays(frame: CGSize) -> some View {
-        let aspect = camera.imageAspect
         ZStack {
             CameraGridOverlay(style: app.gridStyle, opacity: gridOpacity)
             if app.showLevel { LiveLevelGuide(motion: motion).rotatesWithDevice() }
@@ -87,33 +96,39 @@ struct LiveViewfinderView: View {
                 ScanSweep().transition(.opacity)
             }
             if let suggestion = camera.shownSuggestion {
-                SuggestionGuide(rect: AspectFillMapping.toView(suggestion.rect, imageAspect: aspect, viewSize: frame),
-                                subject: AspectFillMapping.toView(suggestion.subject.box, imageAspect: aspect, viewSize: frame),
+                SuggestionGuide(rect: onScreen(suggestion.rect, frame: frame),
+                                subject: onScreen(suggestion.subject.box, frame: frame),
                                 target: CGPoint(x: suggestion.target.x, y: suggestion.target.y),
                                 isAlternative: camera.showsAlternative)
                     .transition(.opacity)
             }
             if camera.isCoaching, let advice = camera.coachAdvice {
                 CoachGuide(advice: advice,
-                           idealFrame: camera.coachPlan.map { AspectFillMapping.toView($0.rect, imageAspect: aspect, viewSize: frame) },
-                           size: frame, tag: camera.subjectTag, showFrame: camera.scanPhase == .guiding)
+                           idealFrame: camera.coachPlan.map { onScreen($0.rect, frame: frame) },
+                           size: frame, tag: camera.framingBox == nil ? camera.subjectTag : nil,
+                           showFrame: camera.scanPhase == .guiding)
+                    .transition(.opacity)
+            }
+            if let box = camera.framingBox {
+                FramingBox(rect: CGRect(x: box.minX * frame.width, y: box.minY * frame.height,
+                                        width: box.width * frame.width, height: box.height * frame.height),
+                           tag: camera.subjectTag)
                     .transition(.opacity)
             }
             if let chosen = camera.frame {
-                FrameGuide(rect: AspectFillMapping.toView(chosen, imageAspect: aspect, viewSize: frame),
+                FrameGuide(rect: onScreen(chosen, frame: frame),
                            viewSize: frame,
                            isEditing: camera.isComposing,
                            isAligned: camera.alignment?.isAligned == true,
-                           target: camera.alignment.map { AspectFillMapping.toView($0.target, imageAspect: aspect, viewSize: frame) })
+                           target: camera.alignment.map { onScreen($0.target, frame: frame) })
                     .transition(.opacity)
             }
             if let box = camera.trackedBox, !camera.subjectLost {
+                let r = onScreen(box, frame: frame)
                 RoundedRectangle(cornerRadius: 6, style: .continuous)
                     .strokeBorder(camera.alignment?.isAligned == true ? Color.yellow : .white, lineWidth: 1.5)
-                    .frame(width: max(24, AspectFillMapping.toView(box, imageAspect: aspect, viewSize: frame).width),
-                           height: max(24, AspectFillMapping.toView(box, imageAspect: aspect, viewSize: frame).height))
-                    .position(x: AspectFillMapping.toView(box, imageAspect: aspect, viewSize: frame).midX,
-                              y: AspectFillMapping.toView(box, imageAspect: aspect, viewSize: frame).midY)
+                    .frame(width: max(24, r.width), height: max(24, r.height))
+                    .position(x: r.midX, y: r.midY)
                     .shadow(color: .black.opacity(0.4), radius: 1)
                     .animation(.linear(duration: 0.08), value: box)
             }
@@ -121,6 +136,7 @@ struct LiveViewfinderView: View {
         .allowsHitTesting(false)
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: camera.scan)
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: camera.frame)
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.25), value: camera.framingBox)
     }
 
     @ViewBuilder
@@ -152,7 +168,8 @@ struct LiveViewfinderView: View {
     // MARK: Touch
 
     private func imagePoint(_ location: CGPoint, frame: CGSize) -> CGPoint {
-        AspectFillMapping.toImage(location, imageAspect: camera.imageAspect, viewSize: frame)
+        AspectFillMapping.toImage(ViewCrop.uncropped(location, crop: camera.viewCrop, size: frame),
+                                  imageAspect: camera.imageAspect, viewSize: frame)
     }
 
     private func tap(_ location: CGPoint, frame: CGSize, lock: Bool) {
@@ -259,6 +276,35 @@ private struct SuggestionGuide: View {
                 .frame(width: 8, height: 8)
                 .position(x: rect.minX + target.x * rect.width, y: rect.minY + target.y * rect.height)
         }
+    }
+}
+
+/// The frame the scan chose, for a moment before the viewfinder crops to it: a bold yellow rounded box in the
+/// viewfinder's shape, with the subject's name under it.
+private struct FramingBox: View {
+    let rect: CGRect
+    var tag: String?
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: max(6, min(rect.width, rect.height) * 0.14), style: .continuous)
+                .strokeBorder(Color.yellow, lineWidth: 3)
+                .frame(width: rect.width, height: rect.height)
+                .shadow(color: .yellow.opacity(0.35), radius: 4)
+                .position(x: rect.midX, y: rect.midY)
+            if let tag {
+                Text(tag)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.yellow)
+                    .lineLimit(2)
+                    .frame(width: max(rect.width + 60, 150), alignment: .leading)
+                    .shadow(color: .black.opacity(0.6), radius: 1)
+                    .offset(x: rect.minX, y: rect.maxY + 6)
+                    .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .accessibilityHidden(true)
     }
 }
 

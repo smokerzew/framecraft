@@ -13,6 +13,49 @@ final class CompositionTests: XCTestCase {
         return f
     }
 
+    func testScanCropFillsTheViewWithTheChosenFrame() throws {
+        // A centered frame a fifth of the view: the lens does it all (like .5× → 2.5×), no digital crop.
+        let centered = CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2)
+        XCTAssertEqual(ViewCrop.lensFactor(for: centered), 5, accuracy: 0.001)
+        XCTAssertNil(ViewCrop.crop(centered, afterZoom: 5))
+
+        // Off center: the lens zooms until the far edge reaches the view's edge, the rest is cropped.
+        let off = CGRect(x: 0.5, y: 0.3, width: 0.25, height: 0.25)
+        let k = ViewCrop.lensFactor(for: off)
+        XCTAssertEqual(k, 2, accuracy: 0.001)
+        let c = try XCTUnwrap(ViewCrop.crop(off, afterZoom: k))
+        XCTAssertEqual(c.width, 0.5, accuracy: 0.001)
+        XCTAssertEqual(c.height, 0.5, accuracy: 0.001)
+        XCTAssertEqual(c.minX, 0.5, accuracy: 0.001)
+        XCTAssertEqual(c.minY, 0.1, accuracy: 0.001)
+
+        // When the lens can't zoom as far, the crop takes over and still lands on the same frame.
+        let partial = try XCTUnwrap(ViewCrop.crop(off, afterZoom: 1))
+        XCTAssertEqual(partial.minX, off.minX, accuracy: 0.001)
+        XCTAssertEqual(partial.minY, off.minY, accuracy: 0.001)
+        XCTAssertEqual(partial.width, off.width, accuracy: 0.001)
+
+        // The photo's crop is the same part of the image the cropped viewfinder shows.
+        let visible = CGRect(x: 0, y: 0.1, width: 1, height: 0.8)
+        let shown = ViewCrop.visible(visible, crop: partial)
+        XCTAssertEqual(shown.minX, 0.5, accuracy: 0.001)
+        XCTAssertEqual(shown.minY, 0.1 + 0.3 * 0.8, accuracy: 0.001)
+        XCTAssertEqual(ViewCrop.inView(shown, visible: visible).width, partial.width, accuracy: 0.001)
+
+        // Screen points and rects map through the crop and back.
+        let size = CGSize(width: 300, height: 400)
+        let p = ViewCrop.uncropped(CGPoint(x: 150, y: 200), crop: partial, size: size)
+        XCTAssertEqual(p.x, (0.5 + 0.125) * 300, accuracy: 0.001)
+        let back = ViewCrop.cropped(CGRect(origin: p, size: .zero), crop: partial, size: size)
+        XCTAssertEqual(back.minX, 150, accuracy: 0.001)
+        XCTAssertEqual(back.minY, 200, accuracy: 0.001)
+
+        // A frame past the view (zoom out) is pulled inside.
+        let wide = try XCTUnwrap(ViewCrop.crop(CGRect(x: -0.1, y: 0.2, width: 0.9, height: 0.9), afterZoom: 1))
+        XCTAssertEqual(wide.minX, 0, accuracy: 0.001)
+        XCTAssertLessThanOrEqual(wide.maxY, 1.0001)
+    }
+
     func testMaxCropSizeFitsTheImage() {
         let square = CompositionEngine.maxCropSize(aspect: 1, imageAspect: 0.75)
         XCTAssertEqual(square.width, 1, accuracy: 0.0001)

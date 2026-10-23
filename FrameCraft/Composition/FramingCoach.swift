@@ -91,6 +91,52 @@ struct ViewContext: Equatable, Sendable {
     var isFront = false
 }
 
+/// The scan's crop: the chosen frame (viewfinder coordinates, 0...1) fills the viewfinder. The lens zooms about
+/// the center as far as keeps the frame in view; the rest is a digital crop, and the photo gets the same crop.
+enum ViewCrop {
+    /// How far the lens should zoom (×) so the frame's farthest edge just reaches the view's edge
+    /// (below 1 when the frame reaches past what the camera sees now).
+    static func lensFactor(for box: CGRect) -> CGFloat {
+        let reach = max(abs(box.minX - 0.5), abs(box.maxX - 0.5), abs(box.minY - 0.5), abs(box.maxY - 0.5))
+        return 0.5 / max(reach, 0.01)
+    }
+
+    /// The frame after the lens zoomed by `factor`: the view's shape, kept inside the view.
+    /// nil when it's (nearly) the whole view.
+    static func crop(_ box: CGRect, afterZoom factor: CGFloat) -> CGRect? {
+        let side = min(1, max(box.width, box.height) * factor)
+        guard side < 0.97 else { return nil }
+        let mid = CGPoint(x: 0.5 + (box.midX - 0.5) * factor, y: 0.5 + (box.midY - 0.5) * factor)
+        return CGRect(x: min(max(mid.x - side / 2, 0), 1 - side), y: min(max(mid.y - side / 2, 0), 1 - side),
+                      width: side, height: side)
+    }
+
+    /// An image rect as viewfinder coordinates, given the image's visible part.
+    static func inView(_ rect: CGRect, visible v: CGRect) -> CGRect {
+        CGRect(x: (rect.minX - v.minX) / v.width, y: (rect.minY - v.minY) / v.height,
+               width: rect.width / v.width, height: rect.height / v.height)
+    }
+
+    /// The part of the image the cropped viewfinder shows.
+    static func visible(_ v: CGRect, crop: CGRect?) -> CGRect {
+        guard let c = crop else { return v }
+        return CGRect(x: v.minX + c.minX * v.width, y: v.minY + c.minY * v.height, width: c.width * v.width, height: c.height * v.height)
+    }
+
+    /// A point on the cropped viewfinder → the same spot on the uncropped preview (both in points).
+    static func uncropped(_ p: CGPoint, crop: CGRect?, size: CGSize) -> CGPoint {
+        guard let c = crop else { return p }
+        return CGPoint(x: (c.minX + p.x / size.width * c.width) * size.width, y: (c.minY + p.y / size.height * c.height) * size.height)
+    }
+
+    /// A rect on the uncropped preview → where it shows on the cropped viewfinder (both in points).
+    static func cropped(_ r: CGRect, crop: CGRect?, size: CGSize) -> CGRect {
+        guard let c = crop else { return r }
+        return CGRect(x: (r.minX / size.width - c.minX) / c.width * size.width, y: (r.minY / size.height - c.minY) / c.height * size.height,
+                      width: r.width / c.width, height: r.height / c.height)
+    }
+}
+
 /// What to do to reach a plan, measured on the current frame.
 struct CoachAdvice: Equatable, Sendable {
     /// Where the anchor should be in the frame now (accounting for any suggested zoom).

@@ -81,10 +81,14 @@ The visual style (dark Liquid Glass camera chrome, yellow accents) comes from th
 ### Scan flow (the ✦ button), modeled on the owner's screen recording of Framed
 
 1. **✦** → `LiveCameraModel.startAutoScan()`. The phase becomes `.finding` ("Finding your shot…" in yellow), the button turns to ✕, and live analysis runs about 5 times a second.
-2. After about 4 steady framing plans → `.framing`. If the plan needs a zoom change, the camera zooms itself ("Framing your shot…"); otherwise it says "Centered — framing up…".
-3. After about 0.9 s:
-   - `ShotDirector` runs `VNClassifyImageRequest` on the subject's box and on the whole scene. That produces the green tag ("flower · bedroom").
-   - It measures subject-versus-background brightness and builds a one-line instruction from templates.
+2. After about 4 steady framing plans → `.framing`. The chosen frame shows as a bold yellow rounded box (`framingBox`) with the subject's name in yellow under it, and "Centered — framing up…" (or "Framing up…") in yellow. Meanwhile `ShotDirector` runs `VNClassifyImageRequest` on the subject's box and on the whole scene, which produces the tag ("flower · bedroom").
+3. After about 0.8 s the box goes, the text turns green ("Framing your shot…"), and the **viewfinder crops itself to the chosen frame** (`ViewCrop`, `crop(to:)`):
+   - The lens zooms about the center as far as keeps the frame in view (`ViewCrop.lensFactor`); any remainder is a digital crop (`viewCrop`, viewfinder 0...1). `CameraPreviewView.CropView` scales the preview and live look to fill the viewfinder with it.
+   - The zoom buttons show the combined zoom. Overlays, taps and focus map through the crop. The photo gets the same crop (`AppModel.captureCrop`), and it can be changed later in the editor's Crop.
+   - Zooming by hand drops the crop. ↻ and ✕ undo it and restore the zoom from before.
+   - This copies the behavior in the owner's Framed screen recording (16–18 s: yellow box, then .5× → 2.5×).
+4. About 0.8 s after the crop:
+   - The instruction is built from templates plus a subject-versus-background brightness measurement.
    - On iOS 26 with Apple Intelligence, `FoundationModels` rewords the line, with a 2.5 s timeout and a cleanup step.
    - Phase becomes `.guiding`: the instruction shows in green and the button becomes ↻.
 4. While guiding: a target cross (it turns green when lined up), a green tag that follows the subject, a haptic when framed, and "Framed — take the shot".

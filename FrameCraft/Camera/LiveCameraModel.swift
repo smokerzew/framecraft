@@ -70,6 +70,12 @@ final class LiveCameraModel {
     private(set) var scanPhase: ScanPhase = .idle
     private(set) var subjectTag: String?
     private(set) var instruction: String?
+    /// The chosen frame as a yellow box (viewfinder 0...1), shown for a moment before the view crops to it.
+    private(set) var framingBox: CGRect?
+    /// The scan's crop: the part of the viewfinder (0...1) blown up to fill it, so what you see is the chosen
+    /// frame and the photo is cropped to it. nil = the whole view.
+    private(set) var viewCrop: CGRect?
+    @ObservationIgnored private var zoomBeforeCrop: CGFloat?
     /// Zoom the scan chose, so the zoom buttons follow it.
     @ObservationIgnored var onAutoZoom: (@MainActor (CGFloat) -> Void)?
     @ObservationIgnored private var stablePlans = 0
@@ -162,6 +168,13 @@ final class LiveCameraModel {
     /// Zoom in Camera-app units, clamped to what this camera can do. Returns the value applied.
     @discardableResult
     func setZoom(_ zoom: CGFloat, animated: Bool = false) -> CGFloat {
+        // Zooming by hand takes over from the scan's crop.
+        viewCrop = nil
+        zoomBeforeCrop = nil
+        return setLensZoom(zoom, animated: animated)
+    }
+
+    private func setLensZoom(_ zoom: CGFloat, animated: Bool) -> CGFloat {
         let value = min(max(zoom, capabilities.minZoom), max(capabilities.minZoom, capabilities.maxZoom))
         service.setZoom(value, animated: animated)
         self.zoom = value
@@ -175,6 +188,7 @@ final class LiveCameraModel {
 
     func focus(atLayerPoint point: CGPoint, lock: Bool) {
         guard let previewLayer else { return }
+        let point = ViewCrop.uncropped(point, crop: viewCrop, size: previewLayer.bounds.size)
         service.focus(at: CameraService.devicePoint(point, in: previewLayer), lock: lock)
         if manual.lensPosition != nil { manual.lensPosition = nil }
     }
@@ -257,6 +271,7 @@ final class LiveCameraModel {
         isComposing = false
         dismissScan()
         clearFrame()
+        uncrop()
         subjectTag = nil
         instruction = nil
         stablePlans = 0
@@ -272,28 +287,29 @@ final class LiveCameraModel {
         scanPhase = .idle
         subjectTag = nil
         instruction = nil
+        uncrop()
         stopCoaching()
     }
 
+    /// The chosen frame shows as a yellow box with the subject's name, then the viewfinder crops to it (the lens
+    /// zooms, a digital crop does the rest) and the instruction follows. The photo is cropped the same way.
     private func beginFraming(_ plan: FramingPlan, advice: CoachAdvice) {
-        if let zoomTo = advice.zoomTo {
-            scanPhase = .framing("Framing your shot…")
-            let applied = setZoom(zoomTo, animated: true)
-            onAutoZoom?(applied)
-        } else {
-            scanPhase = .framing("Centered — framing up…")
-        }
+        let box = ViewCrop.inView(plan.rect, visible: viewContext.visible)
+        let centered = abs(box.midX - 0.5) < 0.06 && abs(box.midY - 0.5) < 0.06
+        framingBox = box
+        scanPhase = .framing(centered ? "Centered — framing up…" : "Framing up…")
+        let shown = Date()
         scanTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(900)) // let the zoom settle before naming what's in frame
-            guard let self, !Task.isCancelled, let plan = self.coachPlan, let buffer = self.frames.latestBuffer() else { return }
-            let view = self.viewContext
-            let box = self.subjectBox(plan)
+            guard let self else { return }
+            let region = self.subjectBox(plan)
+            let buffer = self.frames.latestBuffer()
             let facts = await Task.detached(priority: .userInitiated) { () -> ShotDirector.Facts in
-                let subject = ShotDirector.labels(in: buffer, region: box, count: 1).first
-                let scene = ShotDirector.labels(in: buffer, count: 1).first
+                let subject = buffer.flatMap { ShotDirector.labels(in: $0, region: region, count: 1).first }
+                let scene = buffer.flatMap { ShotDirector.labels(in: $0, count: 1).first }
                 let name = subject ?? (plan.kind == .landscape ? "horizon" : plan.kind == .subject ? "subject" : "person")
-                let contrast = box.map { ShotDirector.contrast(in: buffer, region: $0) } ?? 0
-                let fill = box.map { Double(($0.width * $0.height) / max(view.visible.width * view.visible.height, 0.0001)) } ?? 0
+                let contrast = buffer.flatMap { b in region.map { ShotDirector.contrast(in: b, region: $0) } } ?? 0
+                // How much of the chosen frame the subject fills.
+                let fill = region.map { Double(($0.width * $0.height) / max(plan.rect.width * plan.rect.height, 0.0001)) } ?? 0
                 return ShotDirector.Facts(subject: name, scene: scene, kind: plan.kind, contrast: contrast, fill: fill,
                                           anchorX: plan.anchor.x, horizonTarget: plan.horizonTarget, facing: 0)
             }.value
@@ -301,11 +317,38 @@ final class LiveCameraModel {
             var withFacing = facts
             withFacing.facing = self.lastFeatures.flatMap(CompositionEngine.primarySubject)?.facing ?? 0
             self.subjectTag = plan.kind == .landscape ? nil : ShotDirector.tag(subject: facts.subject, scene: facts.scene)
+            // Leave the box up long enough to see what was chosen.
+            let showFor = 0.8 - Date().timeIntervalSince(shown)
+            if showFor > 0 { try? await Task.sleep(for: .seconds(showFor)) }
+            guard !Task.isCancelled else { return }
+            self.framingBox = nil
+            self.scanPhase = .framing("Framing your shot…")
+            self.crop(to: box)
+            let cropped = Date()
             let line = await ShotDirector.wordedInstruction(withFacing)
+            let settle = 0.8 - Date().timeIntervalSince(cropped) // let the zoom finish first
+            if settle > 0 { try? await Task.sleep(for: .seconds(settle)) }
             guard !Task.isCancelled else { return }
             self.instruction = line
             self.scanPhase = .guiding
         }
+    }
+
+    /// Crops the viewfinder to `box` (viewfinder 0...1). The zoom buttons show the combined zoom.
+    private func crop(to box: CGRect) {
+        let before = zoom
+        let lens = setLensZoom(before * ViewCrop.lensFactor(for: box), animated: true)
+        if zoomBeforeCrop == nil { zoomBeforeCrop = before }
+        viewCrop = ViewCrop.crop(box, afterZoom: lens / max(before, 0.01))
+        onAutoZoom?(lens / (viewCrop?.width ?? 1))
+    }
+
+    /// Back to the whole view, at the zoom from before the scan cropped it.
+    private func uncrop() {
+        framingBox = nil
+        viewCrop = nil
+        if let before = zoomBeforeCrop { onAutoZoom?(setLensZoom(before, animated: true)) }
+        zoomBeforeCrop = nil
     }
 
     /// The subject's box (image coordinates) behind a plan, for naming and contrast.
@@ -334,9 +377,11 @@ final class LiveCameraModel {
         if let features = lastFeatures { updateCoach(features) }
     }
 
+    /// What the viewfinder shows now, including the scan's crop.
     var viewContext: ViewContext {
-        ViewContext(visible: AspectFillMapping.visibleRect(imageAspect: imageAspect, viewSize: CGSize(width: captureAspect, height: 1)),
-                    zoom: zoom, minZoom: capabilities.minZoom, maxZoom: max(capabilities.minZoom, capabilities.maxZoom),
+        let whole = AspectFillMapping.visibleRect(imageAspect: imageAspect, viewSize: CGSize(width: captureAspect, height: 1))
+        return ViewContext(visible: ViewCrop.visible(whole, crop: viewCrop),
+                    zoom: zoom / (viewCrop?.width ?? 1), minZoom: capabilities.minZoom, maxZoom: max(capabilities.minZoom, capabilities.maxZoom),
                     isFront: position == .front)
     }
 
